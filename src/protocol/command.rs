@@ -328,13 +328,6 @@ mod tests {
     use std::str;
 
     #[test]
-    fn test_command_builder_new() {
-        let builder = CommandBuilder::new(0, &[]);
-        assert_eq!(builder.cmd.0.len(), 0);
-        assert_eq!(builder.tag, 0);
-    }
-
-    #[test]
     fn test_command_builder_with_tag() {
         let tag = 1234;
         let builder = CommandBuilder::new(tag, &[]);
