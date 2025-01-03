@@ -5,10 +5,11 @@ use crate::{
         command::Command,
         error::{MissingWord, ProtocolError},
         word::{next_sentence, TrapCategory, TrapResult, Word, WordCategory, WordType},
-        WordContent, WordSequenceItem,
+        WordSequenceItem,
     },
 };
 use log::error;
+use std::fmt::Debug;
 use std::{
     collections::HashMap,
     sync::{
@@ -24,9 +25,10 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 
 pub trait ParsedMessage: Send + 'static {
-    fn parse_message(sentence: &[(&[u8], Option<&[u8]>)]) -> Self;
-    fn process_error(error: &Error) -> Self;
-    fn process_trap(result: TrapResult) -> Self;
+    type Context: Send + 'static + Debug;
+    fn parse_message(sentence: &[(&[u8], Option<&[u8]>)], context: &Self::Context) -> Self;
+    fn process_error(error: &Error, context: &Self::Context) -> Self;
+    fn process_trap(result: TrapResult, context: &Self::Context) -> Self;
 }
 
 #[derive(Debug, Clone)]
@@ -35,35 +37,40 @@ pub struct MikrotikDevice<D: ParsedMessage> {
 }
 
 impl<D: ParsedMessage> MikrotikDevice<D> {
-    fn create_command(&self, command: impl WordContent) -> CommandBuilder {
+    fn create_command<'a>(&self, command: impl Into<WordSequenceItem<'a>>) -> CommandBuilder {
         let tag = self
             .inner
             .next_tag
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed);
         CommandBuilder::new(tag, command)
     }
     pub async fn send_command<F: FnOnce(CommandBuilder) -> CommandBuilder>(
         &self,
-        command: &[u8],
+        command: impl Into<WordSequenceItem<'_>>,
         command_builder: F,
+        context: D::Context,
     ) -> ReceiverStream<D> {
         let cmd = command_builder(self.create_command(command)).build();
         let (response_sender, response_receiver) = mpsc::channel(16);
         self.inner
             .command_tx_send
-            .send((cmd, response_sender))
+            .send((cmd, response_sender, context))
             .await
             .expect("Send command failed");
         ReceiverStream::new(response_receiver)
     }
-    pub async fn send_simple_command(&self, command: &[u8]) -> ReceiverStream<D> {
-        self.send_command(command, |cb| cb).await
+    pub async fn send_simple_command(
+        &self,
+        command: impl Into<WordSequenceItem<'_>>,
+        context: D::Context,
+    ) -> ReceiverStream<D> {
+        self.send_command(command, |cb| cb, context).await
     }
 }
 
 #[derive(Debug)]
 struct InnerMikrotikDevice<D: ParsedMessage> {
-    command_tx_send: mpsc::Sender<(Command, mpsc::Sender<D>)>,
+    command_tx_send: mpsc::Sender<(Command, mpsc::Sender<D>, D::Context)>,
     next_tag: AtomicU16,
 }
 
@@ -86,7 +93,7 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         // Split for independent read/write
         let (mut tcp_rx, mut tcp_tx) = stream.into_split();
         let (command_tx_send, mut command_tx_recv) =
-            mpsc::channel::<(Command, mpsc::Sender<D>)>(16);
+            mpsc::channel::<(Command, mpsc::Sender<D>, D::Context)>(16);
         let mut running_commands = HashMap::new();
         let tag_sequence: AtomicU16 = Default::default();
 
@@ -165,12 +172,12 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                         },
                                             // Send commands to the device
                     maybe_actor_message = command_tx_recv.recv() => match maybe_actor_message {
-                        Some(( Command{ tag, data},response_queue)) => {
+                        Some(( Command{ tag, data},response_queue, context)) => {
                             // Error writing the command to the device, shutdown the connection
                             match tcp_tx.write_all(&data).await {
                                 Ok(_) => {
                                     // The command is sent, store the channel to send the responses back
-                                    running_commands.insert(tag, response_queue);
+                                    running_commands.insert(tag, (response_queue,context));
                                 }
                                 Err(e) => {
                                     // Error writing the command to the device, notify every running command and shutdown the connection
@@ -207,11 +214,11 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
 }
 
 async fn notify_error<D: ParsedMessage>(
-    running_commands: &mut HashMap<u16, mpsc::Sender<D>>,
+    running_commands: &mut HashMap<u16, (mpsc::Sender<D>, D::Context)>,
     error: &Error,
 ) {
-    for (_, queue) in running_commands.drain() {
-        if let Err(send_error) = queue.send(D::process_error(error)).await {
+    for (_, (queue, context)) in running_commands.drain() {
+        if let Err(send_error) = queue.send(D::process_error(error, &context)).await {
             error!("Error processing error:  {:?} / {:?}", error, send_error);
         }
     }
@@ -219,7 +226,7 @@ async fn notify_error<D: ParsedMessage>(
 
 async fn process_sentence<D: ParsedMessage>(
     sentence: &[Word<'_>],
-    running_commands: &mut HashMap<u16, mpsc::Sender<D>>,
+    running_commands: &mut HashMap<u16, (mpsc::Sender<D>, D::Context)>,
 ) -> Result<(), ProtocolError> {
     let mut sentence_iter = sentence.iter();
     let word = sentence_iter
@@ -270,11 +277,10 @@ async fn process_sentence<D: ParsedMessage>(
                     })?,
                 }
             }
-            send_message_back(
-                running_commands,
-                &mut found_tag,
-                D::parse_message(&attributes),
-            )
+            // D::parse_message(&attributes)
+            send_message_back(running_commands, &mut found_tag, |context| {
+                D::parse_message(&attributes, context)
+            })
             .await?;
         }
         WordCategory::Trap => {
@@ -313,18 +319,18 @@ async fn process_sentence<D: ParsedMessage>(
                     })?,
                 }
             }
-            let message = match (found_category, found_message) {
-                (Some(category), Some(message)) => {
-                    D::process_trap(TrapResult { category, message })
+            send_message_back(running_commands, &mut found_tag, |context| {
+                match (found_category, found_message) {
+                    (category, Some(message)) => {
+                        D::process_trap(TrapResult { category, message }, context)
+                    }
+                    (_, None) => D::process_error(
+                        &Error::Protocol(ProtocolError::MissingMessageInTrap),
+                        context,
+                    ),
                 }
-                (None, _) => {
-                    D::process_error(&Error::Protocol(ProtocolError::MissingCategoryInTrap))
-                }
-                (_, None) => {
-                    D::process_error(&Error::Protocol(ProtocolError::MissingMessageInTrap))
-                }
-            };
-            send_message_back(running_commands, &mut found_tag, message).await?;
+            })
+            .await?;
         }
         WordCategory::Fatal => {
             error!("Fatal error from device")
@@ -333,18 +339,16 @@ async fn process_sentence<D: ParsedMessage>(
     Ok(())
 }
 
-async fn send_message_back<D: ParsedMessage>(
-    running_commands: &mut HashMap<u16, mpsc::Sender<D>>,
+async fn send_message_back<D: ParsedMessage, F: FnOnce(&D::Context) -> D>(
+    running_commands: &mut HashMap<u16, (mpsc::Sender<D>, D::Context)>,
     found_tag: &mut Option<u16>,
-    message: D,
+    message_builder: F,
 ) -> Result<(), ProtocolError> {
     let tag = found_tag.ok_or(ProtocolError::IncompleteSentence(MissingWord::Tag))?;
-    if let Err(e) = running_commands
+    let (sender, context) = running_commands
         .get(&tag)
-        .ok_or(ProtocolError::UnknownTag(tag))?
-        .send(message)
-        .await
-    {
+        .ok_or(ProtocolError::UnknownTag(tag))?;
+    if let Err(e) = sender.send(message_builder(context)).await {
         error!("Cannot send response on tag {tag}: {:?}", e);
         running_commands.remove(&tag);
     }

@@ -58,52 +58,59 @@ impl WordContent for &str {
 }
 
 pub enum WordSequenceItem<'a> {
-    DataRef(&'a [u8]),
-    Data(Box<[u8]>),
-    Sequence(&'a [WordSequenceItem<'a>]),
+    Data(Cow<'a, [u8]>),
+    Sequence(Box<[WordSequenceItem<'a>]>),
+    SequenceRef(&'a [WordSequenceItem<'a>]),
 }
+
 impl<'a> From<&'a [u8]> for WordSequenceItem<'a> {
     fn from(value: &'a [u8]) -> Self {
-        WordSequenceItem::DataRef(value)
+        WordSequenceItem::Data(Cow::Borrowed(value))
     }
 }
 impl<'a, const N: usize> From<&'a [u8; N]> for WordSequenceItem<'a> {
     fn from(value: &'a [u8; N]) -> Self {
-        WordSequenceItem::DataRef(value)
+        WordSequenceItem::Data(Cow::Borrowed(value))
+    }
+}
+impl<'a, const N: usize> From<&'a [&'a [u8]; N]> for WordSequenceItem<'a> {
+    fn from(value: &'a [&'a [u8]; N]) -> Self {
+        WordSequenceItem::Sequence(
+            value
+                .into_iter()
+                .copied()
+                .map(Cow::Borrowed)
+                .map(WordSequenceItem::Data)
+                .collect(),
+        )
     }
 }
 impl<'a> From<&'a [WordSequenceItem<'a>]> for WordSequenceItem<'a> {
     fn from(value: &'a [WordSequenceItem<'a>]) -> Self {
-        WordSequenceItem::Sequence(value)
+        WordSequenceItem::SequenceRef(value)
     }
 }
 impl<'a, const N: usize> From<&'a [WordSequenceItem<'a>; N]> for WordSequenceItem<'a> {
     fn from(value: &'a [WordSequenceItem<'a>; N]) -> Self {
-        WordSequenceItem::Sequence(value)
+        WordSequenceItem::SequenceRef(value)
     }
 }
 impl<'a> From<Cow<'a, [u8]>> for WordSequenceItem<'a> {
     fn from(value: Cow<'a, [u8]>) -> Self {
-        match value {
-            Cow::Borrowed(d) => WordSequenceItem::DataRef(d),
-            Cow::Owned(d) => WordSequenceItem::Data(d.into()),
-        }
+        WordSequenceItem::Data(value)
     }
 }
 impl WordContent for WordSequenceItem<'_> {
     fn byte_count(&self) -> usize {
         match self {
-            WordSequenceItem::DataRef(d) => d.len(),
             WordSequenceItem::Sequence(parts) => parts.iter().map(|x| x.byte_count()).sum(),
             WordSequenceItem::Data(d) => d.len(),
+            WordSequenceItem::SequenceRef(parts) => parts.iter().map(|x| x.byte_count()).sum(),
         }
     }
 
     fn write_to_buffer(&self, buffer: &mut Vec<u8>) {
         match self {
-            WordSequenceItem::DataRef(d) => {
-                buffer.extend_from_slice(d);
-            }
             WordSequenceItem::Sequence(parts) => {
                 for item in parts.iter() {
                     item.write_to_buffer(buffer);
@@ -111,6 +118,11 @@ impl WordContent for WordSequenceItem<'_> {
             }
             WordSequenceItem::Data(d) => {
                 buffer.extend_from_slice(d);
+            }
+            WordSequenceItem::SequenceRef(parts) => {
+                for item in parts.iter() {
+                    item.write_to_buffer(buffer);
+                }
             }
         }
     }

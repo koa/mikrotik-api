@@ -200,11 +200,11 @@ pub fn next_sentence(data: &[u8]) -> Result<(Vec<Word>, usize), ProtocolError> {
 }
 
 pub struct TrapResult<'a> {
-    pub category: TrapCategory,
+    pub category: Option<TrapCategory>,
     pub message: &'a [u8],
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum TrapCategory {
     MissingItemOrCommand,
     ArgumentValueFailure,
@@ -214,6 +214,20 @@ pub enum TrapCategory {
     ApiError,
     TtyError,
     ReturnValue,
+}
+impl TrapCategory {
+    pub fn description(&self) -> &'static str {
+        match self {
+            TrapCategory::MissingItemOrCommand => "missing item or command",
+            TrapCategory::ArgumentValueFailure => "argument value failure",
+            TrapCategory::ExecutionInterrupted => "execution of command interrupted",
+            TrapCategory::ScriptingError => "scripting related failure",
+            TrapCategory::GeneralError => "a general failure",
+            TrapCategory::ApiError => "API related failure",
+            TrapCategory::TtyError => "TTY related failure",
+            TrapCategory::ReturnValue => "value generated with :return command",
+        }
+    }
 }
 impl TryFrom<&[u8]> for TrapCategory {
     type Error = ();

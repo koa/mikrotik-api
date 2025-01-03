@@ -26,7 +26,9 @@ async fn main() -> anyhow::Result<()> {
         args.password.as_deref().map(|v| encode_latin1_lossy(v)),
     )
     .await?;
-    let mut stream = device.send_simple_command(b"/system/resource/print").await;
+    let mut stream = device
+        .send_simple_command(b"/system/resource/print", ())
+        .await;
     while let Some(result) = stream.next().await {
         println!("Result: {result:?}");
     }

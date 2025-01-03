@@ -19,11 +19,11 @@ pub struct CommandBuilder {
 
 impl CommandBuilder {
     /// Begin building a new [`Command`] with a randomly generated tag.
-    pub fn new(tag: u16, command: impl WordContent) -> Self {
+    pub fn new<'a>(tag: u16, command: impl Into<WordSequenceItem<'a>>) -> Self {
         let mut cmd = CommandBuffer::default();
         let string = tag.to_string();
         let tag_str: WordSequenceItem = string.as_bytes().into();
-        cmd.write_word(command);
+        cmd.write_word(command.into());
         cmd.write_word([b".tag=".into(), tag_str]);
         Self { tag, cmd }
     }
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn test_command_builder_with_tag() {
         let tag = 1234;
-        let builder = CommandBuilder::new(tag, &[]);
+        let builder = CommandBuilder::new(tag, b"");
         assert_eq!(builder.tag, tag);
     }
 
