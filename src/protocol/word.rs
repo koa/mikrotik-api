@@ -75,6 +75,8 @@ pub enum WordCategory {
     Trap,
     /// Represents a `!fatal` response.
     Fatal,
+    /// Represents a `!empty` response.
+    Empty,
 }
 
 impl TryFrom<&[u8]> for WordCategory {
@@ -86,6 +88,7 @@ impl TryFrom<&[u8]> for WordCategory {
             b"re" => Ok(Self::Reply),
             b"trap" => Ok(Self::Trap),
             b"fatal" => Ok(Self::Fatal),
+            b"empty" => Ok(Self::Empty),
             _ => Err(ProtocolError::InvalidCategory(Box::from(value))),
         }
     }
@@ -98,6 +101,7 @@ impl fmt::Display for WordCategory {
             WordCategory::Reply => "!re",
             WordCategory::Trap => "!trap",
             WordCategory::Fatal => "!fatal",
+            WordCategory::Empty => "!empty",
         })
     }
 }

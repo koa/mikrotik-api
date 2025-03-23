@@ -9,9 +9,9 @@ use crate::{
     },
 };
 use log::error;
-use std::fmt::Debug;
 use std::{
     collections::HashMap,
+    fmt::Debug,
     sync::{
         atomic::{AtomicU16, Ordering},
         Arc,
@@ -38,10 +38,7 @@ pub struct MikrotikDevice<D: ParsedMessage> {
 
 impl<D: ParsedMessage> MikrotikDevice<D> {
     fn create_command<'a>(&self, command: impl Into<WordSequenceItem<'a>>) -> CommandBuilder {
-        let tag = self
-            .inner
-            .next_tag
-            .fetch_add(1, Ordering::Relaxed);
+        let tag = self.inner.next_tag.fetch_add(1, Ordering::Relaxed);
         CommandBuilder::new(tag, command)
     }
     pub async fn send_command<F: FnOnce(CommandBuilder) -> CommandBuilder>(
@@ -277,7 +274,6 @@ async fn process_sentence<D: ParsedMessage>(
                     })?,
                 }
             }
-            // D::parse_message(&attributes)
             send_message_back(running_commands, &mut found_tag, |context| {
                 D::parse_message(&attributes, context)
             })
@@ -335,6 +331,7 @@ async fn process_sentence<D: ParsedMessage>(
         WordCategory::Fatal => {
             error!("Fatal error from device")
         }
+        WordCategory::Empty => {}
     }
     Ok(())
 }
