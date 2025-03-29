@@ -25,7 +25,7 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 
 pub trait ParsedMessage: Send + 'static {
-    type Context: Send + 'static + Debug;
+    type Context: Send + 'static + Debug + Clone;
     fn parse_message(sentence: &[(&[u8], Option<&[u8]>)], context: &Self::Context) -> Self;
     fn process_error(error: &Error, context: &Self::Context) -> Self;
     fn process_trap(result: TrapResult, context: &Self::Context) -> Self;
