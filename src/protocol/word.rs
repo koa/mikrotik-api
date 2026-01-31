@@ -186,7 +186,7 @@ fn read_length(data: &[u8]) -> Result<(u32, usize), ProtocolError> {
     }
 }
 
-pub fn next_sentence(data: &[u8]) -> Result<(Vec<Word>, usize), ProtocolError> {
+pub fn next_sentence(data: &[u8]) -> Result<(Vec<Word<'_>>, usize), ProtocolError> {
     let mut iterator = WordIterator { data, idx: 0 };
     let mut sentence = Vec::new();
     while let Some(item) = iterator.next() {

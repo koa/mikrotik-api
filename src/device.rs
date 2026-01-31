@@ -8,7 +8,7 @@ use crate::{
         WordSequenceItem,
     },
 };
-use log::error;
+use log::{debug, error};
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -141,10 +141,14 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                                 match next_sentence(&packet_buf[offset..]){
                                     Ok((sentence, inc)) => {
                                         offset+=inc;
-                                        if let Err(e)=process_sentence(&sentence, &mut running_commands).await{
+                                        match process_sentence(&sentence, &mut running_commands).await {
+                                            Err(ProtocolError::UnknownTag(tag)) => {
+                                debug!("Unknown tag received: {}", tag);
+                            }
+                                            Err(e) => {
                                             error!("Error processing sentence: {}", e);
                                             running = false;
-                                        }
+                                        }Ok(..) => {}}
                                     }
                                     Err(ProtocolError::Incomplete) => {
                                         if offset < packet_buf.len() {
