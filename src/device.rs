@@ -18,7 +18,7 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrs},
     sync::mpsc,
 };
@@ -72,6 +72,9 @@ struct InnerMikrotikDevice<D: ParsedMessage> {
 }
 
 impl<D: ParsedMessage> MikrotikDevice<D> {
+    /// Connect over a plain TCP socket - the common case. See
+    /// [`MikrotikDevice::connect_with_stream`] for connecting over anything
+    /// else (e.g. a stream already tunnelled through a SOCKS proxy).
     pub async fn connect<
         'u,
         'p,
@@ -85,10 +88,30 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
     ) -> Result<MikrotikDevice<D>, Error> {
         let stream = TcpStream::connect(addr).await.map_err(Arc::new)?;
         stream.set_nodelay(true).map_err(Arc::new)?;
+        Self::connect_with_stream(stream, username, password).await
+    }
 
+    /// Log in and start the connection's background dispatch task over an
+    /// already-established stream, instead of dialing a `TcpStream` directly.
+    /// This is what lets a caller route the connection through something
+    /// other than a direct TCP dial - e.g. a SOCKS-proxied stream reaching a
+    /// device that is only reachable via another host's routing, the way an
+    /// operator would reach it in a real deployment with a single management
+    /// entry point.
+    pub async fn connect_with_stream<
+        'u,
+        'p,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        U: Into<WordSequenceItem<'u>>,
+        P: Into<WordSequenceItem<'p>>,
+    >(
+        stream: S,
+        username: U,
+        password: Option<P>,
+    ) -> Result<MikrotikDevice<D>, Error> {
         let mut running = true;
         // Split for independent read/write
-        let (mut tcp_rx, mut tcp_tx) = stream.into_split();
+        let (mut tcp_rx, mut tcp_tx) = io::split(stream);
         let (command_tx_send, mut command_tx_recv) =
             mpsc::channel::<(Command, mpsc::Sender<D>, D::Context)>(16);
         let mut running_commands = HashMap::new();
