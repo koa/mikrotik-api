@@ -5,6 +5,10 @@ protocol over TCP, default port 8728). No domain/config knowledge — pure trans
 Used by `mikrotik-model` (in this workspace: `../mikrotik-model`), which builds the typed
 RouterOS config model on top of it.
 
+Login is the post-6.43 one (`/login =name= =password=`). A RouterOS before 6.43 answers it with a
+challenge (`!done =ret=<hex>`), which `connect_with_stream` answers once with
+`=response=00<md5(0x00 + password + challenge)>`; any other reply is `LoginFailed`.
+
 ## Commits
 
 - One focused commit per logical change; split unrelated work (e.g. a refactor and the feature

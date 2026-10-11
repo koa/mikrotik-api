@@ -9,6 +9,7 @@ tokio-stream = "0.1.17"
 log = { version = "0.4.22", features = [] }
 thiserror = "2.0.9"
 encoding_rs = "0.8.35"
+md5 = "0.8"
 [dev-dependencies]
 tokio = { version = "1.42.0", features = ["net","rt","io-util","macros","sync","rt-multi-thread"]}
 clap = { version = "4.5.23", features = ["derive"] }

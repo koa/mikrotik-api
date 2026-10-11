@@ -5,7 +5,7 @@ use crate::{
         command::Command,
         error::{MissingWord, ProtocolError},
         word::{next_sentence, TrapCategory, TrapResult, Word, WordCategory, WordType},
-        WordSequenceItem,
+        WordContent, WordSequenceItem,
     },
 };
 use log::{debug, error};
@@ -117,13 +117,24 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         let mut running_commands = HashMap::new();
         let tag_sequence: AtomicU16 = Default::default();
 
+        let bytes = |item: WordSequenceItem| {
+            let mut buffer = Vec::with_capacity(item.byte_count());
+            item.write_to_buffer(&mut buffer);
+            buffer
+        };
+        let username = bytes(username.into());
+        let password = password.map(|password| bytes(password.into()));
         let login_tag = tag_sequence.fetch_add(1, Ordering::Relaxed);
-        let login_packet = CommandBuilder::login(login_tag, username, password);
+        let login_packet =
+            CommandBuilder::login(login_tag, username.as_slice(), password.as_deref());
         tcp_tx
             .write_all(login_packet.data.as_ref())
             .await
             .map_err(Arc::new)?;
 
+        // RouterOS before 6.43 answers the login with a challenge (`=ret=`) instead of
+        // logging in, and wants the MD5 of a zero byte, the password and the challenge back
+        let mut answered_challenge = false;
         let mut packet_buf = Vec::new();
         loop {
             let read = tcp_rx.read_buf(&mut packet_buf).await.map_err(Arc::new)?;
@@ -132,16 +143,39 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                 break;
             } else {
                 match next_sentence(&packet_buf) {
-                    Ok((sentence, inc)) => {
-                        if let &[Word::Category(WordCategory::Done), Word::Tag(_)] =
-                            sentence.as_slice()
-                        {
+                    Ok((sentence, inc)) => match *sentence.as_slice() {
+                        [Word::Category(WordCategory::Done), Word::Tag(_)] => {
                             packet_buf = packet_buf.split_off(inc);
                             break;
-                        } else {
-                            Err(Error::LoginFailed)?;
                         }
-                    }
+                        [
+                            Word::Category(WordCategory::Done),
+                            Word::Tag(_),
+                            Word::Attribute {
+                                key: b"ret",
+                                value: Some(challenge),
+                            },
+                        ] if !answered_challenge => {
+                            let challenge = decode_hex(challenge).ok_or(Error::LoginFailed)?;
+                            packet_buf = packet_buf.split_off(inc);
+                            let mut digest = vec![0];
+                            digest.extend_from_slice(password.as_deref().unwrap_or_default());
+                            digest.extend_from_slice(&challenge);
+                            let response = format!("00{:x}", md5::compute(digest));
+                            let tag = tag_sequence.fetch_add(1, Ordering::Relaxed);
+                            let packet = CommandBuilder::login_response(
+                                tag,
+                                username.as_slice(),
+                                response.as_bytes(),
+                            );
+                            tcp_tx
+                                .write_all(packet.data.as_ref())
+                                .await
+                                .map_err(Arc::new)?;
+                            answered_challenge = true;
+                        }
+                        _ => Err(Error::LoginFailed)?,
+                    },
                     Err(ProtocolError::Incomplete) => continue,
                     Err(e) => Err(Error::Protocol(e))?,
                 }
@@ -377,4 +411,11 @@ async fn send_message_back<D: ParsedMessage, F: FnOnce(&D::Context) -> D>(
         running_commands.remove(&tag);
     }
     Ok(())
+}
+
+/// The bytes of a hex string (the login challenge of RouterOS before 6.43).
+fn decode_hex(hex: &[u8]) -> Option<Vec<u8>> {
+    hex.chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }

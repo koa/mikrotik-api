@@ -59,6 +59,19 @@ impl CommandBuilder {
         .build()
     }
 
+    /// The second `/login` of RouterOS before 6.43: the answer to its challenge (see
+    /// `MikrotikDevice::connect_with_stream`).
+    pub fn login_response<'u, 'r, U: Into<WordSequenceItem<'u>>, R: Into<WordSequenceItem<'r>>>(
+        tag: u16,
+        username: U,
+        response: R,
+    ) -> Command {
+        Self::new(tag, b"/login")
+            .attribute(b"name", username)
+            .attribute(b"response", response)
+            .build()
+    }
+
     /// Builds a command to cancel a specific running command identified by `tag`.
     ///
     /// # Arguments
