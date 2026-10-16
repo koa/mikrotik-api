@@ -49,11 +49,16 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
     ) -> ReceiverStream<D> {
         let cmd = command_builder(self.create_command(command)).build();
         let (response_sender, response_receiver) = mpsc::channel(16);
-        self.inner
+        // the connection is gone (the device closed it, or reading it failed): the command
+        // answers that instead
+        if let Err(mpsc::error::SendError((_, response_sender, context))) = self
+            .inner
             .command_tx_send
             .send((cmd, response_sender, context))
             .await
-            .expect("Send command failed");
+        {
+            let _ = response_sender.try_send(D::process_error(&Error::ConnectionClosed, &context));
+        }
         ReceiverStream::new(response_receiver)
     }
     pub async fn send_simple_command(
@@ -139,8 +144,7 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         loop {
             let read = tcp_rx.read_buf(&mut packet_buf).await.map_err(Arc::new)?;
             if read == 0 {
-                running = false;
-                break;
+                return Err(Error::ClosedAtLogin);
             } else {
                 match next_sentence(&packet_buf) {
                     Ok((sentence, inc)) => match *sentence.as_slice() {
@@ -204,7 +208,9 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                             }
                                             Err(e) => {
                                             error!("Error processing sentence: {}", e);
+                                            notify_error(&mut running_commands, &Error::Protocol(e)).await;
                                             running = false;
+                                            break;
                                         }Ok(..) => {}}
                                     }
                                     Err(ProtocolError::Incomplete) => {
@@ -218,6 +224,7 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                                     Err(e) => {
                                         notify_error(&mut running_commands, &Error::Protocol(e)).await;
                                         running=false;
+                                        break;
                                     }
                                 }
                             }
@@ -257,6 +264,14 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                 }
             }
 
+            // commands sent meanwhile get no answer from the device anymore; one sent from now
+            // on fails right away (`send_command`)
+            command_tx_recv.close();
+            while let Some((_, response_queue, context)) = command_tx_recv.recv().await {
+                let _ = response_queue
+                    .send(D::process_error(&Error::ConnectionClosed, &context))
+                    .await;
+            }
             // Final attempt to gracefully close TCP
             let _ = tcp_tx.shutdown().await;
         });

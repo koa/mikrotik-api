@@ -8,6 +8,10 @@ RouterOS config model on top of it.
 Login is the post-6.43 one (`/login =name= =password=`). A RouterOS before 6.43 answers it with a
 challenge (`!done =ret=<hex>`), which `connect_with_stream` answers once with
 `=response=00<md5(0x00 + password + challenge)>`; any other reply is `LoginFailed`.
+When the other end closes the connection before answering the login (the device, or a proxy on
+the way), the connect fails with `ClosedAtLogin`. A connection that ends later (closed, a read or
+protocol error) answers its running commands, the ones still queued and every later one with
+`ConnectionClosed`; `send_command` never panics on it.
 
 ## Commits
 
