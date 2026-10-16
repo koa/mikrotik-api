@@ -146,8 +146,20 @@ impl<'a> Iterator for WordIterator<'a> {
     }
 }
 
-/// Returns the length and the number of bytes read.
+/// Returns the length and the number of bytes read; `Incomplete` while a read ended inside the
+/// length prefix (words from 128 bytes have one of 2 to 5 bytes).
 fn read_length(data: &[u8]) -> Result<(u32, usize), ProtocolError> {
+    let prefix = match data[0] {
+        c if c & 0x80 == 0x00 => 1,
+        c if c & 0xC0 == 0x80 => 2,
+        c if c & 0xE0 == 0xC0 => 3,
+        c if c & 0xF0 == 0xE0 => 4,
+        c if c & 0xF8 == 0xF0 => 5,
+        _ => return Err(ProtocolError::PrefixLength),
+    };
+    if data.len() < prefix {
+        return Err(ProtocolError::Incomplete);
+    }
     let mut c: u32 = data[0] as u32;
     if c & 0x80 == 0x00 {
         Ok((c, 1))
@@ -248,5 +260,31 @@ impl TryFrom<&[u8]> for TrapCategory {
             b"7" => Ok(Self::ReturnValue),
             &_ => Err(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A sentence that arrives a byte at a time, so that reads also end inside the 2-byte length
+    /// prefix of its long word, is incomplete until its last byte.
+    #[test]
+    fn a_read_ending_inside_a_length_prefix_is_incomplete() {
+        let long = format!("=comment={}", "x".repeat(200));
+        let mut data = vec![0x80 | (long.len() >> 8) as u8, long.len() as u8];
+        data.extend_from_slice(long.as_bytes());
+        let mut sentence = vec![3];
+        sentence.extend_from_slice(b"!re");
+        sentence.extend_from_slice(&data);
+        sentence.push(0);
+        for end in 0..sentence.len() {
+            assert!(
+                matches!(next_sentence(&sentence[..end]), Err(ProtocolError::Incomplete)),
+                "{end}"
+            );
+        }
+        let (words, read) = next_sentence(&sentence).unwrap();
+        assert_eq!((words.len(), read), (2, sentence.len()));
     }
 }
