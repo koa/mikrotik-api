@@ -382,8 +382,14 @@ async fn process_sentence<D: ParsedMessage>(
                     } => {
                         found_message = *value;
                     }
-                    Word::Attribute { key, value: _ } => {
-                        Err(ProtocolError::InvalidAttributeInTrap(Box::from(*key)))?
+                    // a trap concerns its command only: an attribute this crate doesn't know
+                    // (a newer RouterOS) is no reason to end the connection
+                    Word::Attribute { key, value } => {
+                        debug!(
+                            "trap attribute ignored: {}={:?}",
+                            String::from_utf8_lossy(key),
+                            value.map(String::from_utf8_lossy)
+                        );
                     }
                     Word::Message(_) => Err(ProtocolError::WordSequence {
                         word: WordType::Message,
