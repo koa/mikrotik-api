@@ -16,12 +16,33 @@ use std::{
         atomic::{AtomicU16, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrs},
     sync::mpsc,
+    time::{interval, timeout, Instant, MissedTickBehavior},
 };
+
+/// How long the device may take to answer the login.
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a command may go without a reply before it fails with
+/// [`Error::ReplyTimeout`] (and is cancelled on the device): every reply counts, so a long
+/// command that keeps answering (a countdown, a monitor) goes on. Over a slow radio link a
+/// connection can stall for good without the TCP connection ending.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A command waiting for replies: where they go, and when it may give up.
+struct Running<D: ParsedMessage> {
+    sender: mpsc::Sender<D>,
+    context: D::Context,
+    reply_timeout: Option<Duration>,
+    last_reply: Instant,
+}
+
+/// A command for the dispatch task: what to send, where its replies go, its reply timeout.
+type Queued<D> = (Command, mpsc::Sender<D>, <D as ParsedMessage>::Context, Option<Duration>);
 use tokio_stream::wrappers::ReceiverStream;
 
 pub trait ParsedMessage: Send + 'static {
@@ -41,20 +62,33 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         let tag = self.inner.next_tag.fetch_add(1, Ordering::Relaxed);
         CommandBuilder::new(tag, command)
     }
+    /// Sends a command, which fails after [`REPLY_TIMEOUT`] without a reply.
     pub async fn send_command<F: FnOnce(CommandBuilder) -> CommandBuilder>(
         &self,
         command: impl Into<WordSequenceItem<'_>>,
         command_builder: F,
         context: D::Context,
     ) -> ReceiverStream<D> {
+        self.send_command_with_reply_timeout(command, command_builder, context, Some(REPLY_TIMEOUT))
+            .await
+    }
+    /// Sends a command that fails after `reply_timeout` without a reply; `None` waits as long
+    /// as the connection lasts.
+    pub async fn send_command_with_reply_timeout<F: FnOnce(CommandBuilder) -> CommandBuilder>(
+        &self,
+        command: impl Into<WordSequenceItem<'_>>,
+        command_builder: F,
+        context: D::Context,
+        reply_timeout: Option<Duration>,
+    ) -> ReceiverStream<D> {
         let cmd = command_builder(self.create_command(command)).build();
         let (response_sender, response_receiver) = mpsc::channel(16);
         // the connection is gone (the device closed it, or reading it failed): the command
         // answers that instead
-        if let Err(mpsc::error::SendError((_, response_sender, context))) = self
+        if let Err(mpsc::error::SendError((_, response_sender, context, _))) = self
             .inner
             .command_tx_send
-            .send((cmd, response_sender, context))
+            .send((cmd, response_sender, context, reply_timeout))
             .await
         {
             let _ = response_sender.try_send(D::process_error(&Error::ConnectionClosed, &context));
@@ -72,7 +106,7 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
 
 #[derive(Debug)]
 struct InnerMikrotikDevice<D: ParsedMessage> {
-    command_tx_send: mpsc::Sender<(Command, mpsc::Sender<D>, D::Context)>,
+    command_tx_send: mpsc::Sender<Queued<D>>,
     next_tag: AtomicU16,
 }
 
@@ -96,8 +130,8 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         Self::connect_with_stream(stream, username, password).await
     }
 
-    /// Log in and start the connection's background dispatch task over an
-    /// already-established stream, instead of dialing a `TcpStream` directly.
+    /// Log in (within [`LOGIN_TIMEOUT`]) and start the connection's background dispatch task
+    /// over an already-established stream, instead of dialing a `TcpStream` directly.
     /// This is what lets a caller route the connection through something
     /// other than a direct TCP dial - e.g. a SOCKS-proxied stream reaching a
     /// device that is only reachable via another host's routing, the way an
@@ -117,9 +151,8 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         let mut running = true;
         // Split for independent read/write
         let (mut tcp_rx, mut tcp_tx) = io::split(stream);
-        let (command_tx_send, mut command_tx_recv) =
-            mpsc::channel::<(Command, mpsc::Sender<D>, D::Context)>(16);
-        let mut running_commands = HashMap::new();
+        let (command_tx_send, mut command_tx_recv) = mpsc::channel::<Queued<D>>(16);
+        let mut running_commands: HashMap<u16, Running<D>> = HashMap::new();
         let tag_sequence: AtomicU16 = Default::default();
 
         let bytes = |item: WordSequenceItem| {
@@ -132,6 +165,8 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         let login_tag = tag_sequence.fetch_add(1, Ordering::Relaxed);
         let login_packet =
             CommandBuilder::login(login_tag, username.as_slice(), password.as_deref());
+        let mut packet_buf = Vec::new();
+        timeout(LOGIN_TIMEOUT, async {
         tcp_tx
             .write_all(login_packet.data.as_ref())
             .await
@@ -140,7 +175,6 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         // RouterOS before 6.43 answers the login with a challenge (`=ret=`) instead of
         // logging in, and wants the MD5 of a zero byte, the password and the challenge back
         let mut answered_challenge = false;
-        let mut packet_buf = Vec::new();
         loop {
             let read = tcp_rx.read_buf(&mut packet_buf).await.map_err(Arc::new)?;
             if read == 0 {
@@ -185,8 +219,14 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                 }
             }
         }
+        Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| Error::LoginTimeout(LOGIN_TIMEOUT))??;
 
         tokio::spawn(async move {
+            let mut check = interval(Duration::from_secs(1));
+            check.set_missed_tick_behavior(MissedTickBehavior::Delay);
             while running {
                 tokio::select! {
                     biased;
@@ -237,12 +277,17 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                         },
                                             // Send commands to the device
                     maybe_actor_message = command_tx_recv.recv() => match maybe_actor_message {
-                        Some(( Command{ tag, data},response_queue, context)) => {
+                        Some(( Command{ tag, data},response_queue, context, reply_timeout)) => {
                             // Error writing the command to the device, shutdown the connection
                             match tcp_tx.write_all(&data).await {
                                 Ok(_) => {
                                     // The command is sent, store the channel to send the responses back
-                                    running_commands.insert(tag, (response_queue,context));
+                                    running_commands.insert(tag, Running {
+                                        sender: response_queue,
+                                        context,
+                                        reply_timeout,
+                                        last_reply: Instant::now(),
+                                    });
                                 }
                                 Err(e) => {
                                     // Error writing the command to the device, notify every running command and shutdown the connection
@@ -261,13 +306,35 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                             running = false;
                         }
                     },
+                    _ = check.tick() => {
+                        let now = Instant::now();
+                        let timed_out: Vec<(u16, Duration)> = running_commands
+                            .iter()
+                            .filter_map(|(tag, command)| {
+                                command
+                                    .reply_timeout
+                                    .filter(|limit| now.duration_since(command.last_reply) >= *limit)
+                                    .map(|limit| (*tag, limit))
+                            })
+                            .collect();
+                        for (tag, limit) in timed_out {
+                            if let Some(command) = running_commands.remove(&tag) {
+                                let _ = command
+                                    .sender
+                                    .send(D::process_error(&Error::ReplyTimeout(limit), &command.context))
+                                    .await;
+                            }
+                            let cancel_command = CommandBuilder::cancel(tag);
+                            let _ = tcp_tx.write_all(cancel_command.data.as_ref()).await;
+                        }
+                    }
                 }
             }
 
             // commands sent meanwhile get no answer from the device anymore; one sent from now
             // on fails right away (`send_command`)
             command_tx_recv.close();
-            while let Some((_, response_queue, context)) = command_tx_recv.recv().await {
+            while let Some((_, response_queue, context, _)) = command_tx_recv.recv().await {
                 let _ = response_queue
                     .send(D::process_error(&Error::ConnectionClosed, &context))
                     .await;
@@ -287,11 +354,15 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
 }
 
 async fn notify_error<D: ParsedMessage>(
-    running_commands: &mut HashMap<u16, (mpsc::Sender<D>, D::Context)>,
+    running_commands: &mut HashMap<u16, Running<D>>,
     error: &Error,
 ) {
-    for (_, (queue, context)) in running_commands.drain() {
-        if let Err(send_error) = queue.send(D::process_error(error, &context)).await {
+    for (_, command) in running_commands.drain() {
+        if let Err(send_error) = command
+            .sender
+            .send(D::process_error(error, &command.context))
+            .await
+        {
             error!("Error processing error:  {:?} / {:?}", error, send_error);
         }
     }
@@ -299,7 +370,7 @@ async fn notify_error<D: ParsedMessage>(
 
 async fn process_sentence<D: ParsedMessage>(
     sentence: &[Word<'_>],
-    running_commands: &mut HashMap<u16, (mpsc::Sender<D>, D::Context)>,
+    running_commands: &mut HashMap<u16, Running<D>>,
 ) -> Result<(), ProtocolError> {
     let mut sentence_iter = sentence.iter();
     let word = sentence_iter
@@ -419,15 +490,16 @@ async fn process_sentence<D: ParsedMessage>(
 }
 
 async fn send_message_back<D: ParsedMessage, F: FnOnce(&D::Context) -> D>(
-    running_commands: &mut HashMap<u16, (mpsc::Sender<D>, D::Context)>,
+    running_commands: &mut HashMap<u16, Running<D>>,
     found_tag: &mut Option<u16>,
     message_builder: F,
 ) -> Result<(), ProtocolError> {
     let tag = found_tag.ok_or(ProtocolError::IncompleteSentence(MissingWord::Tag))?;
-    let (sender, context) = running_commands
-        .get(&tag)
+    let command = running_commands
+        .get_mut(&tag)
         .ok_or(ProtocolError::UnknownTag(tag))?;
-    if let Err(e) = sender.send(message_builder(context)).await {
+    command.last_reply = Instant::now();
+    if let Err(e) = command.sender.send(message_builder(&command.context)).await {
         error!("Cannot send response on tag {tag}: {:?}", e);
         running_commands.remove(&tag);
     }

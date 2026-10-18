@@ -13,6 +13,13 @@ the way), the connect fails with `ClosedAtLogin`. A connection that ends later (
 protocol error) answers its running commands, the ones still queued and every later one with
 `ConnectionClosed`; `send_command` never panics on it.
 
+Nothing waits for the device for good: the login has `LOGIN_TIMEOUT` (30 s, `LoginTimeout`), and
+a command that gets no reply for `REPLY_TIMEOUT` (120 s) answers `ReplyTimeout` and is cancelled
+on the device (`/cancel`); each reply starts the time again, so a monitor or countdown that keeps
+answering goes on. A command that rightly stays silent longer (a script that answers at its end)
+sets its own limit with `send_command_with_reply_timeout` (`None`: as long as the connection
+lasts). The dispatch task checks once a second; `tests/timeouts.rs` runs on tokio's paused clock.
+
 ## Commits
 
 - One focused commit per logical change; split unrelated work (e.g. a refactor and the feature
