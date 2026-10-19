@@ -167,14 +167,14 @@ fn read_length(data: &[u8]) -> Result<(u32, usize), ProtocolError> {
         c &= !0xC0;
         c <<= 8;
         c += data[1] as u32;
-        return Ok((c, 2));
+        Ok((c, 2))
     } else if c & 0xE0 == 0xC0 {
         c &= !0xE0;
         c <<= 8;
         c += data[1] as u32;
         c <<= 8;
         c += data[2] as u32;
-        return Ok((c, 3));
+        Ok((c, 3))
     } else if c & 0xF0 == 0xE0 {
         c &= !0xF0;
         c <<= 8;
@@ -183,7 +183,7 @@ fn read_length(data: &[u8]) -> Result<(u32, usize), ProtocolError> {
         c += data[2] as u32;
         c <<= 8;
         c += data[3] as u32;
-        return Ok((c, 4));
+        Ok((c, 4))
     } else if c & 0xF8 == 0xF0 {
         c = data[1] as u32;
         c <<= 8;
@@ -192,7 +192,7 @@ fn read_length(data: &[u8]) -> Result<(u32, usize), ProtocolError> {
         c += data[3] as u32;
         c <<= 8;
         c += data[4] as u32;
-        return Ok((c, 5));
+        Ok((c, 5))
     } else {
         Err(ProtocolError::PrefixLength)
     }

@@ -46,7 +46,7 @@ impl<const N: usize> WordContent for &[u8; N] {
 
 impl WordContent for &str {
     fn byte_count(&self) -> usize {
-        self.bytes().len()
+        self.len()
     }
     fn write_to_buffer(&self, buffer: &mut Vec<u8>) {
         assert!(
@@ -77,7 +77,7 @@ impl<'a, const N: usize> From<&'a [&'a [u8]; N]> for WordSequenceItem<'a> {
     fn from(value: &'a [&'a [u8]; N]) -> Self {
         WordSequenceItem::Sequence(
             value
-                .into_iter()
+                .iter()
                 .copied()
                 .map(Cow::Borrowed)
                 .map(WordSequenceItem::Data)
