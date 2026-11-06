@@ -280,7 +280,10 @@ mod test {
         sentence.push(0);
         for end in 0..sentence.len() {
             assert!(
-                matches!(next_sentence(&sentence[..end]), Err(ProtocolError::Incomplete)),
+                matches!(
+                    next_sentence(&sentence[..end]),
+                    Err(ProtocolError::Incomplete)
+                ),
                 "{end}"
             );
         }

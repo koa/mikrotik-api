@@ -42,7 +42,12 @@ struct Running<D: ParsedMessage> {
 }
 
 /// A command for the dispatch task: what to send, where its replies go, its reply timeout.
-type Queued<D> = (Command, mpsc::Sender<D>, <D as ParsedMessage>::Context, Option<Duration>);
+type Queued<D> = (
+    Command,
+    mpsc::Sender<D>,
+    <D as ParsedMessage>::Context,
+    Option<Duration>,
+);
 use tokio_stream::wrappers::ReceiverStream;
 
 pub trait ParsedMessage: Send + 'static {
@@ -167,59 +172,55 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
             CommandBuilder::login(login_tag, username.as_slice(), password.as_deref());
         let mut packet_buf = Vec::new();
         timeout(LOGIN_TIMEOUT, async {
-        tcp_tx
-            .write_all(login_packet.data.as_ref())
-            .await
-            .map_err(Arc::new)?;
+            tcp_tx
+                .write_all(login_packet.data.as_ref())
+                .await
+                .map_err(Arc::new)?;
 
-        // RouterOS before 6.43 answers the login with a challenge (`=ret=`) instead of
-        // logging in, and wants the MD5 of a zero byte, the password and the challenge back
-        let mut answered_challenge = false;
-        loop {
-            let read = tcp_rx.read_buf(&mut packet_buf).await.map_err(Arc::new)?;
-            if read == 0 {
-                return Err(Error::ClosedAtLogin);
-            } else {
-                match next_sentence(&packet_buf) {
-                    Ok((sentence, inc)) => match *sentence.as_slice() {
-                        [Word::Category(WordCategory::Done), Word::Tag(_)] => {
-                            packet_buf = packet_buf.split_off(inc);
-                            break;
-                        }
-                        [
-                            Word::Category(WordCategory::Done),
-                            Word::Tag(_),
-                            Word::Attribute {
+            // RouterOS before 6.43 answers the login with a challenge (`=ret=`) instead of
+            // logging in, and wants the MD5 of a zero byte, the password and the challenge back
+            let mut answered_challenge = false;
+            loop {
+                let read = tcp_rx.read_buf(&mut packet_buf).await.map_err(Arc::new)?;
+                if read == 0 {
+                    return Err(Error::ClosedAtLogin);
+                } else {
+                    match next_sentence(&packet_buf) {
+                        Ok((sentence, inc)) => match *sentence.as_slice() {
+                            [Word::Category(WordCategory::Done), Word::Tag(_)] => {
+                                packet_buf = packet_buf.split_off(inc);
+                                break;
+                            }
+                            [Word::Category(WordCategory::Done), Word::Tag(_), Word::Attribute {
                                 key: b"ret",
                                 value: Some(challenge),
-                            },
-                        ] if !answered_challenge => {
-                            let challenge = decode_hex(challenge).ok_or(Error::LoginFailed)?;
-                            packet_buf = packet_buf.split_off(inc);
-                            let mut digest = vec![0];
-                            digest.extend_from_slice(password.as_deref().unwrap_or_default());
-                            digest.extend_from_slice(&challenge);
-                            let response = format!("00{:x}", md5::compute(digest));
-                            let tag = tag_sequence.fetch_add(1, Ordering::Relaxed);
-                            let packet = CommandBuilder::login_response(
-                                tag,
-                                username.as_slice(),
-                                response.as_bytes(),
-                            );
-                            tcp_tx
-                                .write_all(packet.data.as_ref())
-                                .await
-                                .map_err(Arc::new)?;
-                            answered_challenge = true;
-                        }
-                        _ => Err(Error::LoginFailed)?,
-                    },
-                    Err(ProtocolError::Incomplete) => continue,
-                    Err(e) => Err(Error::Protocol(e))?,
+                            }] if !answered_challenge => {
+                                let challenge = decode_hex(challenge).ok_or(Error::LoginFailed)?;
+                                packet_buf = packet_buf.split_off(inc);
+                                let mut digest = vec![0];
+                                digest.extend_from_slice(password.as_deref().unwrap_or_default());
+                                digest.extend_from_slice(&challenge);
+                                let response = format!("00{:x}", md5::compute(digest));
+                                let tag = tag_sequence.fetch_add(1, Ordering::Relaxed);
+                                let packet = CommandBuilder::login_response(
+                                    tag,
+                                    username.as_slice(),
+                                    response.as_bytes(),
+                                );
+                                tcp_tx
+                                    .write_all(packet.data.as_ref())
+                                    .await
+                                    .map_err(Arc::new)?;
+                                answered_challenge = true;
+                            }
+                            _ => Err(Error::LoginFailed)?,
+                        },
+                        Err(ProtocolError::Incomplete) => continue,
+                        Err(e) => Err(Error::Protocol(e))?,
+                    }
                 }
             }
-        }
-        Ok::<_, Error>(())
+            Ok::<_, Error>(())
         })
         .await
         .map_err(|_| Error::LoginTimeout(LOGIN_TIMEOUT))??;

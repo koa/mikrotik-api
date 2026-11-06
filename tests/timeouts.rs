@@ -1,8 +1,8 @@
 //! A device (or a way to it) that stops answering: the login and a command fail after their
 //! time limit instead of waiting for good; a command that keeps replying goes on.
-use mikrotik_api::prelude::{LOGIN_TIMEOUT, REPLY_TIMEOUT};
 use mikrotik_api::error::Error;
 use mikrotik_api::prelude::MikrotikDevice;
+use mikrotik_api::prelude::{LOGIN_TIMEOUT, REPLY_TIMEOUT};
 use mikrotik_api::simple::SimpleResult;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -30,7 +30,11 @@ async fn an_unanswered_login_times_out() {
     let start = Instant::now();
     let result =
         MikrotikDevice::<SimpleResult>::connect_with_stream(client, b"admin", Some(b"")).await;
-    assert!(matches!(result, Err(Error::LoginTimeout(_))), "{:?}", result.err());
+    assert!(
+        matches!(result, Err(Error::LoginTimeout(_))),
+        "{:?}",
+        result.err()
+    );
     assert!(start.elapsed() >= LOGIN_TIMEOUT);
 }
 
@@ -76,7 +80,13 @@ async fn a_command_that_keeps_replying_goes_on() {
         // a reply every minute for five minutes, then the end
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            let reply = [word("!re"), word(".tag=1"), word("=status=counting"), vec![0]].concat();
+            let reply = [
+                word("!re"),
+                word(".tag=1"),
+                word("=status=counting"),
+                vec![0],
+            ]
+            .concat();
             device.write_all(&reply).await.unwrap();
         }
         let done = [word("!done"), word(".tag=1"), vec![0]].concat();
@@ -92,6 +102,11 @@ async fn a_command_that_keeps_replying_goes_on() {
         .collect()
         .await;
     assert_eq!(answers.len(), 5, "{answers:?}");
-    assert!(answers.iter().all(|a| matches!(a, SimpleResult::Sentence(_))), "{answers:?}");
+    assert!(
+        answers
+            .iter()
+            .all(|a| matches!(a, SimpleResult::Sentence(_))),
+        "{answers:?}"
+    );
     let _device = fake.await.unwrap();
 }
