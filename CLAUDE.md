@@ -28,4 +28,6 @@ lasts). The dispatch task checks once a second; `tests/timeouts.rs` runs on toki
 - Body: why the change was needed and anything non-obvious, wrapped at ~72 columns.
 - Update this file in the same commit as the change it describes.
 - Commits by Claude end with the `Co-Authored-By: Claude …` trailer, without a session link.
+- Format with `cargo fmt` before every commit; a formatting-only commit goes into
+  `.git-blame-ignore-revs`.
 - Push to `master` only when asked.
