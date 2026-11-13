@@ -5,20 +5,33 @@ protocol over TCP, default port 8728). No domain/config knowledge — pure trans
 Used by `mikrotik-model` (in this workspace: `../mikrotik-model`), which builds the typed
 RouterOS config model on top of it.
 
+A `Connection` is one login over one transport and runs commands of any type
+(`Connection::run`): the dispatch task hands each reply as it came (`Reply`) to its command,
+which reads it with its `Command::Reply`, so raw commands and typed reads share a login. It
+never connects again; once the transport ends `is_closed()` is true. A `Command` (`command.rs`)
+has its path, attributes, reply type and `Effect` as a type (`Read`, `Observe`, `Write`,
+`SessionBound`), so a caller can take commands of one effect only; a `Write` or `SessionBound`
+command advances the `Generation` given at the connect, which all connections of a device may
+share (what was read before may be out of date). `RawCommand` is for commands without a type of
+their own and a code smell: each is a command missing from mikrotik-model's catalog. The
+`MikrotikDevice<D>` facade (every reply read by `D`) and its methods are deprecated and go once
+mikrotik-model and netbox-provisioner are moved (netbox-provisioner
+`docs/concepts/device-access.md`).
+
 Login is the post-6.43 one (`/login =name= =password=`). A RouterOS before 6.43 answers it with a
 challenge (`!done =ret=<hex>`), which `connect_with_stream` answers once with
 `=response=00<md5(0x00 + password + challenge)>`; any other reply is `LoginFailed`.
 When the other end closes the connection before answering the login (the device, or a proxy on
 the way), the connect fails with `ClosedAtLogin`. A connection that ends later (closed, a read or
 protocol error) answers its running commands, the ones still queued and every later one with
-`ConnectionClosed`; `send_command` never panics on it.
+`ConnectionClosed`; `run` never panics on it.
 
 Nothing waits for the device for good: the login has `LOGIN_TIMEOUT` (30 s, `LoginTimeout`), and
 a command that gets no reply for `REPLY_TIMEOUT` (120 s) answers `ReplyTimeout` and is cancelled
 on the device (`/cancel`); each reply starts the time again, so a monitor or countdown that keeps
 answering goes on. A command that rightly stays silent longer (a script that answers at its end)
-sets its own limit with `send_command_with_reply_timeout` (`None`: as long as the connection
-lasts). The dispatch task checks once a second; `tests/timeouts.rs` runs on tokio's paused clock.
+sets its own limit (`Command::reply_timeout`, `None`: as long as the connection lasts). The
+dispatch task checks once a second; `tests/timeouts.rs` runs on tokio's paused clock.
 
 ## Commits
 

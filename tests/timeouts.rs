@@ -1,7 +1,8 @@
 //! A device (or a way to it) that stops answering: the login and a command fail after their
 //! time limit instead of waiting for good; a command that keeps replying goes on.
+use mikrotik_api::command::{Read, SessionBound};
 use mikrotik_api::error::Error;
-use mikrotik_api::prelude::MikrotikDevice;
+use mikrotik_api::prelude::{Connection, Generation, RawCommand};
 use mikrotik_api::prelude::{LOGIN_TIMEOUT, REPLY_TIMEOUT};
 use mikrotik_api::simple::SimpleResult;
 use std::time::Duration;
@@ -29,7 +30,7 @@ async fn an_unanswered_login_times_out() {
     let (client, _device) = tokio::io::duplex(4096);
     let start = Instant::now();
     let result =
-        MikrotikDevice::<SimpleResult>::connect_with_stream(client, b"admin", Some(b"")).await;
+        Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default()).await;
     assert!(
         matches!(result, Err(Error::LoginTimeout(_))),
         "{:?}",
@@ -53,12 +54,14 @@ async fn an_unanswered_command_times_out_and_is_cancelled() {
         }
         device
     });
-    let api = MikrotikDevice::<SimpleResult>::connect_with_stream(client, b"admin", Some(b""))
+    let api = Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default())
         .await
         .expect("login");
     let start = Instant::now();
     let mut answer = api
-        .send_simple_command(b"/system/identity/print".as_slice(), ())
+        .run(&RawCommand::<Read>::new(
+            b"/system/identity/print".as_slice(),
+        ))
         .await;
     let first = answer.next().await;
     assert!(
@@ -93,11 +96,13 @@ async fn a_command_that_keeps_replying_goes_on() {
         device.write_all(&done).await.unwrap();
         device
     });
-    let api = MikrotikDevice::<SimpleResult>::connect_with_stream(client, b"admin", Some(b""))
+    let api = Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default())
         .await
         .expect("login");
     let answers: Vec<_> = api
-        .send_simple_command(b"/system/device-mode/update".as_slice(), ())
+        .run(&RawCommand::<SessionBound>::new(
+            b"/system/device-mode/update".as_slice(),
+        ))
         .await
         .collect()
         .await;

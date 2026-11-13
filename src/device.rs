@@ -1,8 +1,9 @@
 use crate::{
+    command::{Command, Effect, EffectKind},
     error::Error,
     prelude::CommandBuilder,
     protocol::{
-        command::Command,
+        command::Command as ProtocolCommand,
         error::{MissingWord, ProtocolError},
         word::{next_sentence, TrapCategory, TrapResult, Word, WordCategory, WordType},
         WordContent, WordSequenceItem,
@@ -11,11 +12,14 @@ use crate::{
 use log::{debug, error};
 use std::{
     collections::HashMap,
-    fmt::Debug,
+    fmt::{self, Debug, Formatter},
+    marker::PhantomData,
+    pin::Pin,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
@@ -34,21 +38,82 @@ pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A command waiting for replies: where they go, and when it may give up.
-struct Running<D: ParsedMessage> {
-    sender: mpsc::Sender<D>,
-    context: D::Context,
+struct Running {
+    sender: mpsc::Sender<Reply>,
     reply_timeout: Option<Duration>,
     last_reply: Instant,
 }
 
-/// A command for the dispatch task: what to send, where its replies go, its reply timeout.
-type Queued<D> = (
-    Command,
-    mpsc::Sender<D>,
-    <D as ParsedMessage>::Context,
-    Option<Duration>,
-);
-use tokio_stream::wrappers::ReceiverStream;
+/// A command for the dispatch task.
+struct Queued {
+    command: ProtocolCommand,
+    /// where its replies go
+    replies: mpsc::Sender<Reply>,
+    reply_timeout: Option<Duration>,
+}
+
+/// A reply of the device to a command as it came, before the [`ParsedMessage`] of the
+/// command reads it: the connection carries commands of any type.
+#[derive(Debug)]
+enum Reply {
+    /// `!re`: its attributes in their order, a key may come twice
+    Sentence(Box<[Attribute]>),
+    Trap {
+        category: Option<TrapCategory>,
+        message: Box<[u8]>,
+    },
+    Error(Error),
+}
+
+/// An attribute of a reply (`=key=value`).
+#[derive(Debug)]
+struct Attribute {
+    key: Box<[u8]>,
+    value: Option<Box<[u8]>>,
+}
+
+impl Reply {
+    fn parse<D: ParsedMessage>(self, context: &D::Context) -> D {
+        match self {
+            Reply::Sentence(attributes) => {
+                let attributes: Vec<(&[u8], Option<&[u8]>)> = attributes
+                    .iter()
+                    .map(|attribute| (attribute.key.as_ref(), attribute.value.as_deref()))
+                    .collect();
+                D::parse_message(&attributes, context)
+            }
+            Reply::Trap { category, message } => D::process_trap(
+                TrapResult {
+                    category,
+                    message: &message,
+                },
+                context,
+            ),
+            Reply::Error(error) => D::process_error(&error, context),
+        }
+    }
+}
+
+/// The replies of one command, each read by `D`; ends with the command (`!done`).
+pub struct Replies<D: ParsedMessage> {
+    replies: ReceiverStream<Reply>,
+    context: D::Context,
+}
+
+// the context is never pinned, only handed to `parse` by reference
+impl<D: ParsedMessage> Unpin for Replies<D> {}
+
+impl<D: ParsedMessage> Stream for Replies<D> {
+    type Item = D;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<D>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.replies)
+            .poll_next(cx)
+            .map(|reply| reply.map(|reply| reply.parse(&this.context)))
+    }
+}
+use tokio_stream::{wrappers::ReceiverStream, Stream};
 
 pub trait ParsedMessage: Send + 'static {
     type Context: Send + 'static + Debug + Clone;
@@ -57,68 +122,129 @@ pub trait ParsedMessage: Send + 'static {
     fn process_trap(result: TrapResult, context: &Self::Context) -> Self;
 }
 
+/// A login on a device over one transport, for commands of any type
+/// ([`Connection::run`]). It never connects again: once the transport ends, every command
+/// answers [`Error::ConnectionClosed`] and [`Connection::is_closed`] is true. Cloning it gives
+/// another handle on the same login.
 #[derive(Debug, Clone)]
-pub struct MikrotikDevice<D: ParsedMessage> {
-    inner: Arc<InnerMikrotikDevice<D>>,
-}
-
-impl<D: ParsedMessage> MikrotikDevice<D> {
-    fn create_command<'a>(&self, command: impl Into<WordSequenceItem<'a>>) -> CommandBuilder {
-        let tag = self.inner.next_tag.fetch_add(1, Ordering::Relaxed);
-        CommandBuilder::new(tag, command)
-    }
-    /// Sends a command, which fails after [`REPLY_TIMEOUT`] without a reply.
-    pub async fn send_command<F: FnOnce(CommandBuilder) -> CommandBuilder>(
-        &self,
-        command: impl Into<WordSequenceItem<'_>>,
-        command_builder: F,
-        context: D::Context,
-    ) -> ReceiverStream<D> {
-        self.send_command_with_reply_timeout(command, command_builder, context, Some(REPLY_TIMEOUT))
-            .await
-    }
-    /// Sends a command that fails after `reply_timeout` without a reply; `None` waits as long
-    /// as the connection lasts.
-    pub async fn send_command_with_reply_timeout<F: FnOnce(CommandBuilder) -> CommandBuilder>(
-        &self,
-        command: impl Into<WordSequenceItem<'_>>,
-        command_builder: F,
-        context: D::Context,
-        reply_timeout: Option<Duration>,
-    ) -> ReceiverStream<D> {
-        let cmd = command_builder(self.create_command(command)).build();
-        let (response_sender, response_receiver) = mpsc::channel(16);
-        // the connection is gone (the device closed it, or reading it failed): the command
-        // answers that instead
-        if let Err(mpsc::error::SendError((_, response_sender, context, _))) = self
-            .inner
-            .command_tx_send
-            .send((cmd, response_sender, context, reply_timeout))
-            .await
-        {
-            let _ = response_sender.try_send(D::process_error(&Error::ConnectionClosed, &context));
-        }
-        ReceiverStream::new(response_receiver)
-    }
-    pub async fn send_simple_command(
-        &self,
-        command: impl Into<WordSequenceItem<'_>>,
-        context: D::Context,
-    ) -> ReceiverStream<D> {
-        self.send_command(command, |cb| cb, context).await
-    }
+pub struct Connection {
+    inner: Arc<InnerConnection>,
 }
 
 #[derive(Debug)]
-struct InnerMikrotikDevice<D: ParsedMessage> {
-    command_tx_send: mpsc::Sender<Queued<D>>,
+struct InnerConnection {
+    command_tx_send: mpsc::Sender<Queued>,
     next_tag: AtomicU16,
+    generation: Generation,
 }
 
+/// The generation of a device's state: it goes up with every command that changes the
+/// device ([`Effect::Write`], [`Effect::SessionBound`]), on every connection given the same
+/// one. What was read at an older generation may be out of date.
+#[derive(Debug, Clone, Default)]
+pub struct Generation(Arc<AtomicU64>);
+
+impl Generation {
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+    /// Counts a change of the device made otherwise (a script running on it, a reboot).
+    pub fn advance(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Connection {
+    /// Whether the transport ended: every command answers [`Error::ConnectionClosed`].
+    pub fn is_closed(&self) -> bool {
+        self.inner.command_tx_send.is_closed()
+    }
+
+    /// The generation this connection counts its changes in.
+    pub fn generation(&self) -> &Generation {
+        &self.inner.generation
+    }
+
+    /// Sends `command`; its replies are read by its [`Command::Reply`]. A command that
+    /// changes the device advances the [`Generation`] before it goes out.
+    pub async fn run<C: Command>(&self, command: &C) -> Replies<C::Reply> {
+        if matches!(
+            <C::Effect as EffectKind>::EFFECT,
+            Effect::Write | Effect::SessionBound
+        ) {
+            self.inner.generation.advance();
+        }
+        let tag = self.inner.next_tag.fetch_add(1, Ordering::Relaxed);
+        let builder = command.build(CommandBuilder::new(tag, command.path()));
+        self.queue(builder.build(), command.reply_timeout(), command.context())
+            .await
+    }
+
+    async fn queue<D: ParsedMessage>(
+        &self,
+        command: ProtocolCommand,
+        reply_timeout: Option<Duration>,
+        context: D::Context,
+    ) -> Replies<D> {
+        let (replies, received) = mpsc::channel(16);
+        // the connection is gone (the device closed it, or reading it failed): the command
+        // answers that instead
+        if let Err(mpsc::error::SendError(Queued { replies, .. })) = self
+            .inner
+            .command_tx_send
+            .send(Queued {
+                command,
+                replies,
+                reply_timeout,
+            })
+            .await
+        {
+            let _ = replies.try_send(Reply::Error(Error::ConnectionClosed));
+        }
+        Replies {
+            replies: ReceiverStream::new(received),
+            context,
+        }
+    }
+
+    /// The connection as a [`MikrotikDevice`] reading every reply by `D`, for code not moved
+    /// to [`Connection::run`] yet.
+    #[deprecated(note = "send a `Command` with `Connection::run`")]
+    pub fn facade<D: ParsedMessage>(&self) -> MikrotikDevice<D> {
+        MikrotikDevice {
+            connection: self.clone(),
+            parsed: PhantomData,
+        }
+    }
+}
+
+/// A connection reading every reply by `D`: the API before [`Connection`] and [`Command`].
+pub struct MikrotikDevice<D: ParsedMessage> {
+    connection: Connection,
+    parsed: PhantomData<fn() -> D>,
+}
+
+impl<D: ParsedMessage> Clone for MikrotikDevice<D> {
+    fn clone(&self) -> Self {
+        Self {
+            connection: self.connection.clone(),
+            parsed: PhantomData,
+        }
+    }
+}
+
+impl<D: ParsedMessage> Debug for MikrotikDevice<D> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MikrotikDevice")
+            .field("connection", &self.connection)
+            .finish()
+    }
+}
+
+#[allow(deprecated)]
 impl<D: ParsedMessage> MikrotikDevice<D> {
-    /// Connect over a plain TCP socket - the common case. See
-    /// [`MikrotikDevice::connect_with_stream`] for connecting over anything
-    /// else (e.g. a stream already tunnelled through a SOCKS proxy).
+    /// Connects with a generation of its own.
+    #[deprecated(note = "use `Connection::connect`")]
     pub async fn connect<
         'u,
         'p,
@@ -130,9 +256,96 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         username: U,
         password: Option<P>,
     ) -> Result<MikrotikDevice<D>, Error> {
+        Ok(
+            Connection::connect(addr, username, password, Generation::default())
+                .await?
+                .facade(),
+        )
+    }
+    /// Connects over `stream` with a generation of its own.
+    #[deprecated(note = "use `Connection::connect_with_stream`")]
+    pub async fn connect_with_stream<
+        'u,
+        'p,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        U: Into<WordSequenceItem<'u>>,
+        P: Into<WordSequenceItem<'p>>,
+    >(
+        stream: S,
+        username: U,
+        password: Option<P>,
+    ) -> Result<MikrotikDevice<D>, Error> {
+        Ok(
+            Connection::connect_with_stream(stream, username, password, Generation::default())
+                .await?
+                .facade(),
+        )
+    }
+    /// The connection under it.
+    #[deprecated(note = "keep the `Connection` instead")]
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+    /// Sends a command, which fails after [`REPLY_TIMEOUT`] without a reply. It doesn't
+    /// count as a change ([`Generation`]).
+    #[deprecated(note = "send a `Command` with `Connection::run`")]
+    pub async fn send_command<F: FnOnce(CommandBuilder) -> CommandBuilder>(
+        &self,
+        command: impl Into<WordSequenceItem<'_>>,
+        command_builder: F,
+        context: D::Context,
+    ) -> Replies<D> {
+        self.send_command_with_reply_timeout(command, command_builder, context, Some(REPLY_TIMEOUT))
+            .await
+    }
+    /// Sends a command that fails after `reply_timeout` without a reply; `None` waits as long
+    /// as the connection lasts.
+    #[deprecated(note = "send a `Command` with `Connection::run`")]
+    pub async fn send_command_with_reply_timeout<F: FnOnce(CommandBuilder) -> CommandBuilder>(
+        &self,
+        command: impl Into<WordSequenceItem<'_>>,
+        command_builder: F,
+        context: D::Context,
+        reply_timeout: Option<Duration>,
+    ) -> Replies<D> {
+        let tag = self
+            .connection
+            .inner
+            .next_tag
+            .fetch_add(1, Ordering::Relaxed);
+        let command = command_builder(CommandBuilder::new(tag, command)).build();
+        self.connection.queue(command, reply_timeout, context).await
+    }
+    #[deprecated(note = "send a `Command` with `Connection::run`")]
+    pub async fn send_simple_command(
+        &self,
+        command: impl Into<WordSequenceItem<'_>>,
+        context: D::Context,
+    ) -> Replies<D> {
+        self.send_command(command, |cb| cb, context).await
+    }
+}
+
+impl Connection {
+    /// Connect over a plain TCP socket - the common case. See
+    /// [`Connection::connect_with_stream`] for connecting over anything
+    /// else (e.g. a stream already tunnelled through a SOCKS proxy). Its changes count in
+    /// `generation`, which the device's other connections may share.
+    pub async fn connect<
+        'u,
+        'p,
+        A: ToSocketAddrs,
+        U: Into<WordSequenceItem<'u>>,
+        P: Into<WordSequenceItem<'p>>,
+    >(
+        addr: A,
+        username: U,
+        password: Option<P>,
+        generation: Generation,
+    ) -> Result<Connection, Error> {
         let stream = TcpStream::connect(addr).await.map_err(Arc::new)?;
         stream.set_nodelay(true).map_err(Arc::new)?;
-        Self::connect_with_stream(stream, username, password).await
+        Self::connect_with_stream(stream, username, password, generation).await
     }
 
     /// Log in (within [`LOGIN_TIMEOUT`]) and start the connection's background dispatch task
@@ -152,12 +365,13 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
         stream: S,
         username: U,
         password: Option<P>,
-    ) -> Result<MikrotikDevice<D>, Error> {
+        generation: Generation,
+    ) -> Result<Connection, Error> {
         let mut running = true;
         // Split for independent read/write
         let (mut tcp_rx, mut tcp_tx) = io::split(stream);
-        let (command_tx_send, mut command_tx_recv) = mpsc::channel::<Queued<D>>(16);
-        let mut running_commands: HashMap<u16, Running<D>> = HashMap::new();
+        let (command_tx_send, mut command_tx_recv) = mpsc::channel::<Queued>(16);
+        let mut running_commands: HashMap<u16, Running> = HashMap::new();
         let tag_sequence: AtomicU16 = Default::default();
 
         let bytes = |item: WordSequenceItem| {
@@ -278,14 +492,13 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                         },
                                             // Send commands to the device
                     maybe_actor_message = command_tx_recv.recv() => match maybe_actor_message {
-                        Some(( Command{ tag, data},response_queue, context, reply_timeout)) => {
+                        Some(Queued { command: ProtocolCommand { tag, data }, replies, reply_timeout }) => {
                             // Error writing the command to the device, shutdown the connection
                             match tcp_tx.write_all(&data).await {
                                 Ok(_) => {
                                     // The command is sent, store the channel to send the responses back
                                     running_commands.insert(tag, Running {
-                                        sender: response_queue,
-                                        context,
+                                        sender: replies,
                                         reply_timeout,
                                         last_reply: Instant::now(),
                                     });
@@ -322,7 +535,7 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
                             if let Some(command) = running_commands.remove(&tag) {
                                 let _ = command
                                     .sender
-                                    .send(D::process_error(&Error::ReplyTimeout(limit), &command.context))
+                                    .send(Reply::Error(Error::ReplyTimeout(limit)))
                                     .await;
                             }
                             let cancel_command = CommandBuilder::cancel(tag);
@@ -335,43 +548,34 @@ impl<D: ParsedMessage> MikrotikDevice<D> {
             // commands sent meanwhile get no answer from the device anymore; one sent from now
             // on fails right away (`send_command`)
             command_tx_recv.close();
-            while let Some((_, response_queue, context, _)) = command_tx_recv.recv().await {
-                let _ = response_queue
-                    .send(D::process_error(&Error::ConnectionClosed, &context))
-                    .await;
+            while let Some(Queued { replies, .. }) = command_tx_recv.recv().await {
+                let _ = replies.send(Reply::Error(Error::ConnectionClosed)).await;
             }
             // Final attempt to gracefully close TCP
             let _ = tcp_tx.shutdown().await;
         });
 
-        let device = MikrotikDevice {
-            inner: Arc::new(InnerMikrotikDevice {
+        Ok(Connection {
+            inner: Arc::new(InnerConnection {
                 command_tx_send,
                 next_tag: tag_sequence,
+                generation,
             }),
-        };
-        Ok(device)
+        })
     }
 }
 
-async fn notify_error<D: ParsedMessage>(
-    running_commands: &mut HashMap<u16, Running<D>>,
-    error: &Error,
-) {
+async fn notify_error(running_commands: &mut HashMap<u16, Running>, error: &Error) {
     for (_, command) in running_commands.drain() {
-        if let Err(send_error) = command
-            .sender
-            .send(D::process_error(error, &command.context))
-            .await
-        {
+        if let Err(send_error) = command.sender.send(Reply::Error(error.clone())).await {
             error!("Error processing error:  {:?} / {:?}", error, send_error);
         }
     }
 }
 
-async fn process_sentence<D: ParsedMessage>(
+async fn process_sentence(
     sentence: &[Word<'_>],
-    running_commands: &mut HashMap<u16, Running<D>>,
+    running_commands: &mut HashMap<u16, Running>,
 ) -> Result<(), ProtocolError> {
     let mut sentence_iter = sentence.iter();
     let word = sentence_iter
@@ -414,7 +618,10 @@ async fn process_sentence<D: ParsedMessage>(
                         found_tag = Some(*tag);
                     }
                     Word::Attribute { key, value } => {
-                        attributes.push((*key, *value));
+                        attributes.push(Attribute {
+                            key: Box::from(*key),
+                            value: value.map(Box::from),
+                        });
                     }
                     Word::Message(_) => Err(ProtocolError::WordSequence {
                         word: WordType::Message,
@@ -422,9 +629,11 @@ async fn process_sentence<D: ParsedMessage>(
                     })?,
                 }
             }
-            send_message_back(running_commands, &mut found_tag, |context| {
-                D::parse_message(&attributes, context)
-            })
+            send_message_back(
+                running_commands,
+                found_tag,
+                Reply::Sentence(attributes.into_boxed_slice()),
+            )
             .await?;
         }
         WordCategory::Trap => {
@@ -469,18 +678,14 @@ async fn process_sentence<D: ParsedMessage>(
                     })?,
                 }
             }
-            send_message_back(running_commands, &mut found_tag, |context| {
-                match (found_category, found_message) {
-                    (category, Some(message)) => {
-                        D::process_trap(TrapResult { category, message }, context)
-                    }
-                    (_, None) => D::process_error(
-                        &Error::Protocol(ProtocolError::MissingMessageInTrap),
-                        context,
-                    ),
-                }
-            })
-            .await?;
+            let reply = match found_message {
+                Some(message) => Reply::Trap {
+                    category: found_category,
+                    message: Box::from(message),
+                },
+                None => Reply::Error(Error::Protocol(ProtocolError::MissingMessageInTrap)),
+            };
+            send_message_back(running_commands, found_tag, reply).await?;
         }
         WordCategory::Fatal => {
             error!("Fatal error from device")
@@ -490,17 +695,17 @@ async fn process_sentence<D: ParsedMessage>(
     Ok(())
 }
 
-async fn send_message_back<D: ParsedMessage, F: FnOnce(&D::Context) -> D>(
-    running_commands: &mut HashMap<u16, Running<D>>,
-    found_tag: &mut Option<u16>,
-    message_builder: F,
+async fn send_message_back(
+    running_commands: &mut HashMap<u16, Running>,
+    found_tag: Option<u16>,
+    reply: Reply,
 ) -> Result<(), ProtocolError> {
     let tag = found_tag.ok_or(ProtocolError::IncompleteSentence(MissingWord::Tag))?;
     let command = running_commands
         .get_mut(&tag)
         .ok_or(ProtocolError::UnknownTag(tag))?;
     command.last_reply = Instant::now();
-    if let Err(e) = command.sender.send(message_builder(&command.context)).await {
+    if let Err(e) = command.sender.send(reply).await {
         error!("Cannot send response on tag {tag}: {:?}", e);
         running_commands.remove(&tag);
     }

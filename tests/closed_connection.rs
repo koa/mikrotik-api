@@ -1,6 +1,7 @@
 //! A command on a connection the device closed answers an error instead of panicking or
 //! hanging.
-use mikrotik_api::prelude::MikrotikDevice;
+use mikrotik_api::command::Read;
+use mikrotik_api::prelude::{Connection, Generation, RawCommand};
 use mikrotik_api::simple::SimpleResult;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,14 +25,16 @@ async fn a_command_after_the_device_closed_the_connection_fails() {
         device.write_all(&done).await.unwrap();
         drop(device);
     });
-    let api = MikrotikDevice::<SimpleResult>::connect_with_stream(client, b"admin", Some(b""))
+    let api = Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default())
         .await
         .expect("login");
     fake.await.unwrap();
     // queued while the connection closes, and sent once it is closed
     for _ in 0..2 {
         let mut answer = api
-            .send_simple_command(b"/system/identity/print".as_slice(), ())
+            .run(&RawCommand::<Read>::new(
+                b"/system/identity/print".as_slice(),
+            ))
             .await;
         let first = tokio::time::timeout(Duration::from_secs(5), answer.next())
             .await
@@ -39,6 +42,7 @@ async fn a_command_after_the_device_closed_the_connection_fails() {
         assert!(matches!(first, Some(SimpleResult::Error(_))), "{first:?}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(api.is_closed());
 }
 
 /// A device (or a proxy on the way) that closes the connection instead of answering the login:
@@ -52,7 +56,7 @@ async fn a_connection_closed_at_the_login_fails_to_connect() {
         drop(device);
     });
     let result =
-        MikrotikDevice::<SimpleResult>::connect_with_stream(client, b"admin", Some(b"")).await;
+        Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default()).await;
     fake.await.unwrap();
     assert!(
         matches!(result, Err(mikrotik_api::error::Error::ClosedAtLogin)),

@@ -1,9 +1,9 @@
-use mikrotik_api::prelude::MikrotikDevice;
+use mikrotik_api::command::Read;
+use mikrotik_api::prelude::{Connection, Generation, RawCommand};
 use std::net::IpAddr;
 
 use clap::Parser;
 use encoding_rs::mem::encode_latin1_lossy;
-use mikrotik_api::simple::SimpleResult;
 use tokio_stream::StreamExt;
 
 #[derive(Parser, Debug)]
@@ -20,14 +20,17 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let device: MikrotikDevice<SimpleResult> = MikrotikDevice::connect(
+    let device = Connection::connect(
         (args.device, 8728),
         b"admin",
         args.password.as_deref().map(|v| encode_latin1_lossy(v)),
+        Generation::default(),
     )
     .await?;
     let mut stream = device
-        .send_simple_command(b"/system/resource/print", ())
+        .run(&RawCommand::<Read>::new(
+            b"/system/resource/print".as_slice(),
+        ))
         .await;
     while let Some(result) = stream.next().await {
         println!("Result: {result:?}");
