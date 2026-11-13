@@ -400,7 +400,14 @@ impl Connection {
                                             notify_error(&mut running_commands, &Error::Protocol(e)).await;
                                             running = false;
                                             break;
-                                        }Ok(..) => {}}
+                                        }
+                                            // nobody reads its replies anymore: the device
+                                            // may stop sending them
+                                            Ok(Some(Unread(tag))) => {
+                                                let cancel_command = CommandBuilder::cancel(tag);
+                                                let _ = tcp_tx.write_all(cancel_command.data.as_ref()).await;
+                                            }
+                                            Ok(None) => {}}
                                     }
                                     Err(ProtocolError::Incomplete) => {
                                         if offset < packet_buf.len() {
@@ -507,10 +514,14 @@ async fn notify_error(running_commands: &mut HashMap<u16, Running>, error: &Erro
     }
 }
 
+/// A command whose replies nobody reads anymore (its [`Replies`] were dropped before the
+/// end, e.g. after the first row): it is forgotten here and cancelled on the device.
+struct Unread(u16);
+
 async fn process_sentence(
     sentence: &[Word<'_>],
     running_commands: &mut HashMap<u16, Running>,
-) -> Result<(), ProtocolError> {
+) -> Result<Option<Unread>, ProtocolError> {
     let mut sentence_iter = sentence.iter();
     let word = sentence_iter
         .next()
@@ -563,12 +574,12 @@ async fn process_sentence(
                     })?,
                 }
             }
-            send_message_back(
+            return send_message_back(
                 running_commands,
                 found_tag,
                 Reply::Sentence(attributes.into_boxed_slice()),
             )
-            .await?;
+            .await;
         }
         WordCategory::Trap => {
             let mut found_category = None;
@@ -619,31 +630,32 @@ async fn process_sentence(
                 },
                 None => Reply::Error(Error::Protocol(ProtocolError::MissingMessageInTrap)),
             };
-            send_message_back(running_commands, found_tag, reply).await?;
+            return send_message_back(running_commands, found_tag, reply).await;
         }
         WordCategory::Fatal => {
             error!("Fatal error from device")
         }
         WordCategory::Empty => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn send_message_back(
     running_commands: &mut HashMap<u16, Running>,
     found_tag: Option<u16>,
     reply: Reply,
-) -> Result<(), ProtocolError> {
+) -> Result<Option<Unread>, ProtocolError> {
     let tag = found_tag.ok_or(ProtocolError::IncompleteSentence(MissingWord::Tag))?;
     let command = running_commands
         .get_mut(&tag)
         .ok_or(ProtocolError::UnknownTag(tag))?;
     command.last_reply = Instant::now();
-    if let Err(e) = command.sender.send(reply).await {
-        error!("Cannot send response on tag {tag}: {:?}", e);
+    if command.sender.send(reply).await.is_err() {
+        debug!("nobody reads the replies of tag {tag} anymore: cancelled");
         running_commands.remove(&tag);
+        return Ok(Some(Unread(tag)));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The bytes of a hex string (the login challenge of RouterOS before 6.43).

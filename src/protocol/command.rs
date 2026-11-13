@@ -90,7 +90,7 @@ impl CommandBuilder {
     /// ```
     pub fn cancel(tag: u16) -> Command {
         Self::new(tag, b"/cancel")
-            .attribute(b"tag=", tag.to_string().as_bytes())
+            .attribute(b"tag", tag.to_string().as_bytes())
             .build()
     }
 

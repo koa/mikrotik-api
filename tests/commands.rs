@@ -271,3 +271,39 @@ async fn a_prepared_command_sends_what_the_command_would() {
     .concat();
     assert_eq!(fake.await.unwrap(), expected);
 }
+
+/// Replies nobody reads anymore (dropped after the first row) cancel the command on the device.
+#[tokio::test]
+async fn replies_dropped_cancel_the_command() {
+    let (client, mut device) = tokio::io::duplex(4096);
+    let (dropped, wait_dropped) = tokio::sync::oneshot::channel::<()>();
+    let fake = tokio::spawn(async move {
+        let mut buffer = [0u8; 256];
+        let _ = device.read(&mut buffer).await.unwrap();
+        let done = [word("!done"), word(".tag=0"), vec![0]].concat();
+        device.write_all(&done).await.unwrap();
+        let _ = device.read(&mut buffer).await.unwrap();
+        let row = |name: &str| [word("!re"), word(".tag=1"), word(name), vec![0]].concat();
+        device.write_all(&row("=name=a")).await.unwrap();
+        wait_dropped.await.unwrap();
+        device.write_all(&row("=name=b")).await.unwrap();
+        let mut received = Vec::new();
+        while !String::from_utf8_lossy(&received).contains("=tag=1") {
+            let read = device.read(&mut buffer).await.unwrap();
+            received.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8_lossy(&received).into_owned()
+    });
+    let connection =
+        Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default())
+            .await
+            .expect("login");
+    let mut replies = connection.run(&InterfaceKeys).await;
+    assert!(matches!(replies.next().await, Some(Keys::Sentence(_))));
+    drop(replies);
+    dropped.send(()).unwrap();
+    let received = fake.await.unwrap();
+    // `=tag==1` (as it once was) cancels nothing on RouterOS (CHR 7.24.5)
+    assert!(received.contains("/cancel"), "{received:?}");
+    assert!(!received.contains("=tag=="), "{received:?}");
+}

@@ -26,9 +26,12 @@ protocol error) answers its running commands, the ones still queued and every la
 Nothing waits for the device for good: the login has `LOGIN_TIMEOUT` (30 s, `LoginTimeout`), and
 a command that gets no reply for `REPLY_TIMEOUT` (120 s) answers `ReplyTimeout` and is cancelled
 on the device (`/cancel`); each reply starts the time again, so a monitor or countdown that keeps
-answering goes on. A command that rightly stays silent longer (a script that answers at its end)
-sets its own limit (`Command::reply_timeout`, `None`: as long as the connection lasts). The
-dispatch task checks once a second; `tests/timeouts.rs` runs on tokio's paused clock.
+answering goes on. Replies dropped before the end (a read taking the first row) cancel their
+command the same way, at its next reply: RouterOS takes `=tag=<n>` there, `=tag==<n>`
+cancels nothing (CHR 7.24.5, a ping went on to its end). A command that rightly stays silent
+longer (a script that answers at its end) sets its own limit (`Command::reply_timeout`,
+`None`: as long as the connection lasts). The dispatch task checks once a second;
+`tests/timeouts.rs` runs on tokio's paused clock.
 
 ## Commits
 
