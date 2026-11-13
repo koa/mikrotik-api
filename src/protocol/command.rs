@@ -60,7 +60,7 @@ impl CommandBuilder {
     }
 
     /// The second `/login` of RouterOS before 6.43: the answer to its challenge (see
-    /// `MikrotikDevice::connect_with_stream`).
+    /// `Connection::connect_with_stream`).
     pub fn login_response<'u, 'r, U: Into<WordSequenceItem<'u>>, R: Into<WordSequenceItem<'r>>>(
         tag: u16,
         username: U,

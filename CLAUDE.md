@@ -13,10 +13,7 @@ has its path, attributes, reply type and `Effect` as a type (`Read`, `Observe`, 
 `SessionBound`), so a caller can take commands of one effect only; a `Write` or `SessionBound`
 command advances the `Generation` given at the connect, which all connections of a device may
 share (what was read before may be out of date). `RawCommand` is for commands without a type of
-their own and a code smell: each is a command missing from mikrotik-model's catalog. The
-`MikrotikDevice<D>` facade (every reply read by `D`) and its methods are deprecated and go once
-mikrotik-model and netbox-provisioner are moved (netbox-provisioner
-`docs/concepts/device-access.md`).
+their own and a code smell: each is a command missing from mikrotik-model's catalog.
 
 Login is the post-6.43 one (`/login =name= =password=`). A RouterOS before 6.43 answers it with a
 challenge (`!done =ret=<hex>`), which `connect_with_stream` answers once with

@@ -9,8 +9,7 @@ pub mod prelude {
     pub use crate::error::Error;
     use crate::{device, protocol};
     pub use device::{
-        Connection, Generation, MikrotikDevice, ParsedMessage, Replies, LOGIN_TIMEOUT,
-        REPLY_TIMEOUT,
+        Connection, Generation, ParsedMessage, Replies, LOGIN_TIMEOUT, REPLY_TIMEOUT,
     };
     pub use protocol::command::{CommandBuilder, QueryOperator};
     pub use protocol::word::{TrapCategory, TrapResult};

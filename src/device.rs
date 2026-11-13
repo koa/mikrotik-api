@@ -12,8 +12,7 @@ use crate::{
 use log::{debug, error};
 use std::{
     collections::HashMap,
-    fmt::{self, Debug, Formatter},
-    marker::PhantomData,
+    fmt::Debug,
     pin::Pin,
     sync::{
         atomic::{AtomicU16, AtomicU64, Ordering},
@@ -205,124 +204,6 @@ impl Connection {
             replies: ReceiverStream::new(received),
             context,
         }
-    }
-
-    /// The connection as a [`MikrotikDevice`] reading every reply by `D`, for code not moved
-    /// to [`Connection::run`] yet.
-    #[deprecated(note = "send a `Command` with `Connection::run`")]
-    pub fn facade<D: ParsedMessage>(&self) -> MikrotikDevice<D> {
-        MikrotikDevice {
-            connection: self.clone(),
-            parsed: PhantomData,
-        }
-    }
-}
-
-/// A connection reading every reply by `D`: the API before [`Connection`] and [`Command`].
-pub struct MikrotikDevice<D: ParsedMessage> {
-    connection: Connection,
-    parsed: PhantomData<fn() -> D>,
-}
-
-impl<D: ParsedMessage> Clone for MikrotikDevice<D> {
-    fn clone(&self) -> Self {
-        Self {
-            connection: self.connection.clone(),
-            parsed: PhantomData,
-        }
-    }
-}
-
-impl<D: ParsedMessage> Debug for MikrotikDevice<D> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MikrotikDevice")
-            .field("connection", &self.connection)
-            .finish()
-    }
-}
-
-#[allow(deprecated)]
-impl<D: ParsedMessage> MikrotikDevice<D> {
-    /// Connects with a generation of its own.
-    #[deprecated(note = "use `Connection::connect`")]
-    pub async fn connect<
-        'u,
-        'p,
-        A: ToSocketAddrs,
-        U: Into<WordSequenceItem<'u>>,
-        P: Into<WordSequenceItem<'p>>,
-    >(
-        addr: A,
-        username: U,
-        password: Option<P>,
-    ) -> Result<MikrotikDevice<D>, Error> {
-        Ok(
-            Connection::connect(addr, username, password, Generation::default())
-                .await?
-                .facade(),
-        )
-    }
-    /// Connects over `stream` with a generation of its own.
-    #[deprecated(note = "use `Connection::connect_with_stream`")]
-    pub async fn connect_with_stream<
-        'u,
-        'p,
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        U: Into<WordSequenceItem<'u>>,
-        P: Into<WordSequenceItem<'p>>,
-    >(
-        stream: S,
-        username: U,
-        password: Option<P>,
-    ) -> Result<MikrotikDevice<D>, Error> {
-        Ok(
-            Connection::connect_with_stream(stream, username, password, Generation::default())
-                .await?
-                .facade(),
-        )
-    }
-    /// The connection under it.
-    #[deprecated(note = "keep the `Connection` instead")]
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
-    /// Sends a command, which fails after [`REPLY_TIMEOUT`] without a reply. It doesn't
-    /// count as a change ([`Generation`]).
-    #[deprecated(note = "send a `Command` with `Connection::run`")]
-    pub async fn send_command<F: FnOnce(CommandBuilder) -> CommandBuilder>(
-        &self,
-        command: impl Into<WordSequenceItem<'_>>,
-        command_builder: F,
-        context: D::Context,
-    ) -> Replies<D> {
-        self.send_command_with_reply_timeout(command, command_builder, context, Some(REPLY_TIMEOUT))
-            .await
-    }
-    /// Sends a command that fails after `reply_timeout` without a reply; `None` waits as long
-    /// as the connection lasts.
-    #[deprecated(note = "send a `Command` with `Connection::run`")]
-    pub async fn send_command_with_reply_timeout<F: FnOnce(CommandBuilder) -> CommandBuilder>(
-        &self,
-        command: impl Into<WordSequenceItem<'_>>,
-        command_builder: F,
-        context: D::Context,
-        reply_timeout: Option<Duration>,
-    ) -> Replies<D> {
-        let tag = self
-            .connection
-            .inner
-            .next_tag
-            .fetch_add(1, Ordering::Relaxed);
-        let command = command_builder(CommandBuilder::new(tag, command)).build();
-        self.connection.queue(command, reply_timeout, context).await
-    }
-    #[deprecated(note = "send a `Command` with `Connection::run`")]
-    pub async fn send_simple_command(
-        &self,
-        command: impl Into<WordSequenceItem<'_>>,
-        context: D::Context,
-    ) -> Replies<D> {
-        self.send_command(command, |cb| cb, context).await
     }
 }
 
