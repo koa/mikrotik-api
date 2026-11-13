@@ -507,9 +507,15 @@ impl Connection {
 }
 
 async fn notify_error(running_commands: &mut HashMap<u16, Running>, error: &Error) {
-    for (_, command) in running_commands.drain() {
-        if let Err(send_error) = command.sender.send(Reply::Error(error.clone())).await {
-            error!("Error processing error:  {:?} / {:?}", error, send_error);
+    for (tag, command) in running_commands.drain() {
+        // nobody reads its replies anymore: nobody to tell
+        if command
+            .sender
+            .send(Reply::Error(error.clone()))
+            .await
+            .is_err()
+        {
+            debug!("tag {tag} unread at {error:?}");
         }
     }
 }
