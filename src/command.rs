@@ -12,7 +12,7 @@ use std::{borrow::Cow, marker::PhantomData, time::Duration};
 pub enum Effect {
     /// reads configuration or state, without side effect; may be cached (`print`)
     Read,
-    /// reads live values, without side effect; never cached (`monitor once`, `/ping`)
+    /// reads live values, without side effect; a moment's answer (`monitor once`, `/ping`)
     Observe,
     /// changes the device (`add`, `set`, `remove`, `move`, `/execute`, `reboot`)
     Write,
@@ -123,6 +123,52 @@ impl<E: EffectKind> Command for RawCommand<E> {
             .fold(builder, |builder, RawAttribute { key, value }| {
                 builder.attribute(key.as_ref(), value.as_ref())
             })
+    }
+    fn context(&self) {}
+    fn reply_timeout(&self) -> Option<Duration> {
+        self.reply_timeout
+    }
+}
+
+/// A command built once, to send later and from another task (it borrows nothing) and to tell
+/// by what it sends: the same command gives the same [`Prepared::words`]. Its replies read as
+/// [`SimpleResult`]; who keeps them unread reads them by the command's own reply later
+/// ([`Replies::unparsed`](crate::prelude::Replies::unparsed),
+/// [`Replies::kept`](crate::prelude::Replies::kept)).
+#[derive(Debug, Clone)]
+pub struct Prepared<E: EffectKind> {
+    path: Box<[u8]>,
+    words: Box<[u8]>,
+    reply_timeout: Option<Duration>,
+    effect: PhantomData<fn() -> E>,
+}
+
+impl<E: EffectKind> Prepared<E> {
+    pub fn of<C: Command<Effect = E>>(command: &C) -> Self {
+        Prepared {
+            path: command.path().into(),
+            words: command.build(CommandBuilder::bare()).words(),
+            reply_timeout: command.reply_timeout(),
+            effect: PhantomData,
+        }
+    }
+    pub fn path(&self) -> &[u8] {
+        &self.path
+    }
+    /// its attributes and queries as they go out, without path and tag
+    pub fn words(&self) -> &[u8] {
+        &self.words
+    }
+}
+
+impl<E: EffectKind> Command for Prepared<E> {
+    type Effect = E;
+    type Reply = SimpleResult;
+    fn path(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(&self.path)
+    }
+    fn build(&self, builder: CommandBuilder) -> CommandBuilder {
+        builder.append(&self.words)
     }
     fn context(&self) {}
     fn reply_timeout(&self) -> Option<Duration> {

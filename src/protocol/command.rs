@@ -233,6 +233,23 @@ impl CommandBuilder {
         self
     }
 
+    /// A builder of the words after path and tag only ([`CommandBuilder::words`]).
+    pub(crate) fn bare() -> Self {
+        Self {
+            tag: 0,
+            cmd: CommandBuffer::default(),
+        }
+    }
+    /// The words added to a [`CommandBuilder::bare`] one, as they go out.
+    pub(crate) fn words(self) -> Box<[u8]> {
+        self.cmd.0.into_boxed_slice()
+    }
+    /// Adds `words` as [`CommandBuilder::words`] gave them.
+    pub(crate) fn append(mut self, words: &[u8]) -> Self {
+        self.cmd.write_str(words);
+        self
+    }
+
     /// Finalizes the command construction process, producing a [`Command`].
     ///
     /// # Returns

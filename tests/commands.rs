@@ -4,10 +4,12 @@
 use mikrotik_api::command::{Read, Write};
 use mikrotik_api::error::Error;
 use mikrotik_api::prelude::{
-    Command, Connection, Generation, ParsedMessage, RawCommand, TrapResult,
+    Command, Connection, Generation, ParsedMessage, Prepared, RawCommand, Replies, Reply,
+    TrapResult,
 };
 use mikrotik_api::simple::SimpleResult;
 use std::borrow::Cow;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 
@@ -154,4 +156,118 @@ async fn a_change_advances_the_generation_of_every_connection_sharing_it() {
     let _: Vec<_> = connections[1].run(&set).await.collect().await;
     assert_eq!(generation.current(), 2);
     assert_eq!(connections[0].generation().current(), 2);
+}
+
+/// Replies kept unread are read again later, by another type too, as they came: sentences in
+/// their order, the trap; a connection that failed is told apart.
+#[tokio::test]
+async fn kept_replies_read_again_by_any_type() {
+    let (client, mut device) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 256];
+        let _ = device.read(&mut buffer).await.unwrap();
+        let done = [word("!done"), word(".tag=0"), vec![0]].concat();
+        device.write_all(&done).await.unwrap();
+        let mut received = Vec::new();
+        while !String::from_utf8_lossy(&received).contains(".tag=1") {
+            let read = device.read(&mut buffer).await.unwrap();
+            received.extend_from_slice(&buffer[..read]);
+        }
+        let replies = [
+            word("!re"),
+            word(".tag=1"),
+            word("=name=ether1"),
+            word("=mtu=1500"),
+            vec![0],
+            word("!trap"),
+            word(".tag=1"),
+            word("=message=no such item"),
+            vec![0],
+            word("!done"),
+            word(".tag=1"),
+            vec![0],
+        ]
+        .concat();
+        device.write_all(&replies).await.unwrap();
+        // the device goes away: a further command fails
+        drop(device);
+    });
+    let connection =
+        Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default())
+            .await
+            .expect("login");
+    let kept: Vec<Reply> = connection
+        .run(&InterfaceKeys)
+        .await
+        .unparsed()
+        .collect()
+        .await;
+    assert!(kept.iter().all(|reply| !reply.is_failure()));
+    let kept: Arc<[Reply]> = kept.into();
+    let keys: Vec<Keys> = Replies::kept(kept.clone(), ()).collect().await;
+    assert_eq!(
+        keys,
+        [
+            Keys::Sentence(vec![Box::from(*b"name"), Box::from(*b"mtu")]),
+            Keys::Trap(Box::from(*b"no such item")),
+        ]
+    );
+    let rows: Vec<SimpleResult> = Replies::kept(kept, ()).collect().await;
+    assert!(
+        matches!(rows.as_slice(), [SimpleResult::Sentence(row), SimpleResult::Trap { .. }]
+            if row.get("mtu").and_then(|v| v.as_deref()) == Some("1500")),
+        "{rows:?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let failed: Vec<Reply> = connection
+        .run(&InterfaceKeys)
+        .await
+        .unparsed()
+        .collect()
+        .await;
+    assert!(failed.iter().any(Reply::is_failure), "{failed:?}");
+}
+
+/// A prepared command sends what the command would, and the same command gives the same words.
+#[tokio::test]
+async fn a_prepared_command_sends_what_the_command_would() {
+    let print = || {
+        RawCommand::<Read>::new(b"/interface/print".as_slice())
+            .attribute(b".proplist".as_slice(), b"name".as_slice())
+    };
+    let prepared = Prepared::of(&print());
+    assert_eq!(prepared.words(), Prepared::of(&print()).words());
+    assert_ne!(
+        prepared.words(),
+        Prepared::of(&RawCommand::<Read>::new(b"/interface/print".as_slice())).words()
+    );
+    assert_eq!(prepared.path(), b"/interface/print");
+    let (client, mut device) = tokio::io::duplex(4096);
+    let fake = tokio::spawn(async move {
+        let mut buffer = [0u8; 256];
+        let _ = device.read(&mut buffer).await.unwrap();
+        let done = [word("!done"), word(".tag=0"), vec![0]].concat();
+        device.write_all(&done).await.unwrap();
+        let mut received = Vec::new();
+        while !received.ends_with(&[0]) || received.len() < 3 {
+            let read = device.read(&mut buffer).await.unwrap();
+            received.extend_from_slice(&buffer[..read]);
+        }
+        let done = [word("!done"), word(".tag=1"), vec![0]].concat();
+        device.write_all(&done).await.unwrap();
+        received
+    });
+    let connection =
+        Connection::connect_with_stream(client, b"admin", Some(b""), Generation::default())
+            .await
+            .expect("login");
+    let _: Vec<_> = connection.run(&prepared).await.collect().await;
+    let expected = [
+        word("/interface/print"),
+        word(".tag=1"),
+        word("=.proplist=name"),
+        vec![0],
+    ]
+    .concat();
+    assert_eq!(fake.await.unwrap(), expected);
 }

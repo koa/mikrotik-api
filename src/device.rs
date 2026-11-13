@@ -51,10 +51,11 @@ struct Queued {
     reply_timeout: Option<Duration>,
 }
 
-/// A reply of the device to a command as it came, before the [`ParsedMessage`] of the
-/// command reads it: the connection carries commands of any type.
-#[derive(Debug)]
-enum Reply {
+/// A reply of the device to a command as it came, before a [`ParsedMessage`] reads it: the
+/// connection carries commands of any type, and a user may keep the replies to read them
+/// again later, by another type too ([`Replies::unparsed`], [`Replies::kept`]).
+#[derive(Debug, Clone)]
+pub enum Reply {
     /// `!re`: its attributes in their order, a key may come twice
     Sentence(Box<[Attribute]>),
     Trap {
@@ -65,14 +66,19 @@ enum Reply {
 }
 
 /// An attribute of a reply (`=key=value`).
-#[derive(Debug)]
-struct Attribute {
+#[derive(Debug, Clone)]
+pub struct Attribute {
     key: Box<[u8]>,
     value: Option<Box<[u8]>>,
 }
 
 impl Reply {
-    fn parse<D: ParsedMessage>(self, context: &D::Context) -> D {
+    /// Whether it is no answer of the device but the connection failing (closed, no reply in
+    /// time): nothing to keep.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Reply::Error(_))
+    }
+    fn parse<D: ParsedMessage>(&self, context: &D::Context) -> D {
         match self {
             Reply::Sentence(attributes) => {
                 let attributes: Vec<(&[u8], Option<&[u8]>)> = attributes
@@ -83,20 +89,56 @@ impl Reply {
             }
             Reply::Trap { category, message } => D::process_trap(
                 TrapResult {
-                    category,
-                    message: &message,
+                    category: *category,
+                    message,
                 },
                 context,
             ),
-            Reply::Error(error) => D::process_error(&error, context),
+            Reply::Error(error) => D::process_error(error, context),
         }
     }
 }
 
 /// The replies of one command, each read by `D`; ends with the command (`!done`).
 pub struct Replies<D: ParsedMessage> {
-    replies: ReceiverStream<Reply>,
+    replies: Source,
     context: D::Context,
+}
+
+/// Where the replies come from.
+enum Source {
+    /// the device, as they arrive
+    Device(ReceiverStream<Reply>),
+    /// replies kept from an earlier command, from `next` on
+    Kept { replies: Arc<[Reply]>, next: usize },
+}
+
+impl Source {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Reply>> {
+        match self {
+            Source::Device(replies) => Pin::new(replies).poll_next(cx),
+            Source::Kept { replies, next } => {
+                let reply = replies.get(*next).cloned();
+                *next += 1;
+                Poll::Ready(reply)
+            }
+        }
+    }
+}
+
+impl<D: ParsedMessage> Replies<D> {
+    /// The replies of an earlier command (from [`Replies::unparsed`]) read as `D` with
+    /// `context`, as if the command came again.
+    pub fn kept(replies: Arc<[Reply]>, context: D::Context) -> Self {
+        Replies {
+            replies: Source::Kept { replies, next: 0 },
+            context,
+        }
+    }
+    /// The replies as they come, unread, to keep.
+    pub fn unparsed(self) -> Unparsed {
+        Unparsed(self.replies)
+    }
 }
 
 // the context is never pinned, only handed to `parse` by reference
@@ -107,9 +149,20 @@ impl<D: ParsedMessage> Stream for Replies<D> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<D>> {
         let this = self.get_mut();
-        Pin::new(&mut this.replies)
+        this.replies
             .poll_next(cx)
             .map(|reply| reply.map(|reply| reply.parse(&this.context)))
+    }
+}
+
+/// The replies of one command unread ([`Replies::unparsed`]); ends with the command.
+pub struct Unparsed(Source);
+
+impl Stream for Unparsed {
+    type Item = Reply;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Reply>> {
+        self.get_mut().0.poll_next(cx)
     }
 }
 use tokio_stream::{wrappers::ReceiverStream, Stream};
@@ -201,7 +254,7 @@ impl Connection {
             let _ = replies.try_send(Reply::Error(Error::ConnectionClosed));
         }
         Replies {
-            replies: ReceiverStream::new(received),
+            replies: Source::Device(ReceiverStream::new(received)),
             context,
         }
     }
